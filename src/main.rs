@@ -33,7 +33,7 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:8080")]
     listen: String,
     /// The longest a job waits on the model, in seconds.
-    #[arg(long, default_value_t = 600)]
+    #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..))]
     timeout_s: u64,
 }
 

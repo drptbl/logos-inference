@@ -113,6 +113,8 @@ impl From<Refusal> for Answer {
 struct Ask {
     job: String,
     input: Value,
+    /// What the buyer paid, on a job.
+    price_lepta: Option<String>,
     deadline_ms: Option<u64>,
 }
 
@@ -146,7 +148,16 @@ fn read(request: &mut tiny_http::Request) -> Result<Ask, Answer> {
     if body.len() as u64 > MAX_BODY {
         return Err(Answer::reason(413, "the request is too big"));
     }
-    serde_json::from_slice(&body).map_err(|_| Answer::reason(400, "not a job request"))
+    let ask: Ask =
+        serde_json::from_slice(&body).map_err(|_| Answer::reason(400, "not a job request"))?;
+    // logos-agents' job ids are 32 hex characters; this bounds what is kept and logged.
+    if ask.job.is_empty()
+        || ask.job.len() > 128
+        || !ask.job.bytes().all(|b| b.is_ascii_alphanumeric())
+    {
+        return Err(Answer::reason(400, "not a job id"));
+    }
+    Ok(ask)
 }
 
 impl State {
@@ -170,25 +181,49 @@ impl State {
     }
 
     fn run(&self, ask: &Ask) -> Answer {
+        let prompt = match self.paid_prompt(ask) {
+            Ok(prompt) => prompt,
+            Err(answer) => return answer,
+        };
         // One model call per job: a second arrival waits for the first and gets its output.
         let slot = self.jobs.slot(&ask.job);
         let mut output = slot.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(body) = output.as_ref() {
             return Answer::json(body.clone());
         }
-        let answer = self
-            .prompt(ask)
-            .and_then(|prompt| self.complete(&prompt, ask.deadline_ms));
-        let answer = match answer {
+        let answer = match self.complete(&prompt, ask.deadline_ms) {
             Ok(text) => {
                 let body = json!({ "output": { "text": text } });
                 *output = Some(body.clone());
                 Answer::json(body)
             }
-            Err(answer) => answer,
+            Err(answer) => {
+                // Nothing to keep: the next arrival asks the model again.
+                self.jobs.forget(&ask.job, &slot);
+                answer
+            }
         };
         eprintln!("job {:?}: {}", ask.job, answer.status);
         answer
+    }
+
+    /// The job's prompt, if the buyer paid at least what it costs at this offer's rates.
+    /// An offer served without this quote handler would otherwise run at its fallback price.
+    fn paid_prompt(&self, ask: &Ask) -> Result<Prompt, Answer> {
+        let paid = ask
+            .price_lepta
+            .as_deref()
+            .and_then(|p| p.parse::<u128>().ok())
+            .ok_or_else(|| Answer::reason(400, "not a job request"))?;
+        let prompt = self.prompt(ask)?;
+        let price = prompt.price(&self.config.pricing);
+        if paid < price {
+            return Err(Answer::reason(
+                422,
+                format!("paid {paid} lepta, but this job costs {price}"),
+            ));
+        }
+        Ok(prompt)
     }
 
     /// Asks the model, until the job's deadline at the latest.
@@ -293,5 +328,15 @@ impl Jobs {
             slots.remove(&oldest);
         }
         slot
+    }
+
+    /// Drops a job's slot that holds no output, unless another arrival replaced it.
+    fn forget(&self, job: &str, slot: &Slot) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let (slots, order) = &mut *inner;
+        if slots.get(job).is_some_and(|kept| Arc::ptr_eq(kept, slot)) {
+            slots.remove(job);
+            order.retain(|j| j != job);
+        }
     }
 }

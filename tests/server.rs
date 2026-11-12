@@ -201,7 +201,7 @@ fn declines_a_job_the_model_refuses_with_its_own_reason() {
 
 #[test]
 fn asks_to_be_retried_when_the_backend_fails_for_now() {
-    for upstream in [500, 503, 429, 401, 404] {
+    for upstream in [500, 503, 429, 401, 404, 302] {
         let backend = fake_backend(Box::new(move |_| (upstream, "nope".into())));
         let url = start(&backend, None);
         let (status, body) = post(&format!("{url}/run"), &job("e1", "Hi"));
@@ -281,4 +281,72 @@ fn refuses_a_body_it_cannot_read_and_unknown_paths() {
     let url = start(&backend, None);
     assert_eq!(post(&format!("{url}/run"), &json!({"job": "h1"})).0, 400);
     assert_eq!(post(&format!("{url}/other"), &job("h2", "Hi")).0, 404);
+}
+
+#[test]
+fn declines_a_paid_job_it_cannot_run() {
+    let backend = fake_backend(answering("unused"));
+    let url = start(&backend, None);
+    let mut over = job(
+        "i1",
+        r#"{"messages":[{"role":"user","content":"Hi"}],"max_tokens":65}"#,
+    );
+    over["price_lepta"] = json!("1000000");
+    assert_eq!(
+        post(&format!("{url}/run"), &over),
+        (422, "max_tokens is at most 64".into())
+    );
+    assert!(backend.asked.lock().unwrap().is_empty());
+}
+
+#[test]
+fn declines_a_job_paid_below_its_price() {
+    let backend = fake_backend(answering("unused"));
+    let url = start(&backend, None);
+    // "Hi" costs (1 + 4) x 10 + 64 x 100 = 6450 lepta.
+    let mut cheap = job("i2", "Hi");
+    cheap["price_lepta"] = json!("6449");
+    assert_eq!(
+        post(&format!("{url}/run"), &cheap),
+        (422, "paid 6449 lepta, but this job costs 6450".into())
+    );
+    cheap["price_lepta"] = json!("6450");
+    cheap["job"] = json!("i3");
+    assert_eq!(post(&format!("{url}/run"), &cheap).0, 200);
+    assert_eq!(backend.asked.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn asks_the_model_again_when_a_job_failed_for_now() {
+    let calls = Arc::new(Mutex::new(0));
+    let counted = calls.clone();
+    let backend = fake_backend(Box::new(move |_| {
+        let mut calls = counted.lock().unwrap();
+        *calls += 1;
+        if *calls == 1 {
+            (500, "busy".into())
+        } else {
+            completion("second time")
+        }
+    }));
+    let url = start(&backend, None);
+    assert_eq!(post(&format!("{url}/run"), &job("j1", "Hi")).0, 502);
+    assert_eq!(post(&format!("{url}/run"), &job("j1", "Hi")).0, 200);
+    assert_eq!(*calls.lock().unwrap(), 2);
+}
+
+#[test]
+fn refuses_a_body_over_its_limit_and_a_job_id_it_would_not_send() {
+    let backend = fake_backend(answering("unused"));
+    let url = start(&backend, None);
+    let big = job("k1", &"a".repeat(17 << 20));
+    assert_eq!(post(&format!("{url}/run"), &big).0, 413);
+    for bad in ["", "not/an-id", &"a".repeat(129)] {
+        assert_eq!(
+            post(&format!("{url}/run"), &job(bad, "Hi")).0,
+            400,
+            "{bad:?}"
+        );
+    }
+    assert!(backend.asked.lock().unwrap().is_empty());
 }
