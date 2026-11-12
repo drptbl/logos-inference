@@ -241,7 +241,8 @@ fn gives_up_on_the_model_at_the_jobs_deadline() {
     }));
     let url = start(&backend, None);
     let mut late = job("f1", "Hi");
-    late["deadline_ms"] = json!(now_ms() + 1_000);
+    // logos-agents stops waiting 6 minutes before the deadline: a second is left of that.
+    late["deadline_ms"] = json!(now_ms() + 361_000);
     let started = Instant::now();
     assert_eq!(
         post(&format!("{url}/run"), &late),
@@ -390,15 +391,18 @@ fn a_job_that_fails_while_a_duplicate_waits_is_still_asked_once_at_a_time() {
 }
 
 #[test]
-fn does_not_ask_the_model_for_a_job_past_its_deadline() {
+fn does_not_ask_the_model_for_a_job_too_close_to_its_deadline() {
     let backend = fake_backend(answering("too late"));
     let url = start(&backend, None);
-    let mut late = job("m1", "Hi");
-    late["deadline_ms"] = json!(now_ms() - 1);
-    assert_eq!(
-        post(&format!("{url}/run"), &late),
-        (504, "the job's deadline has passed".into())
-    );
+    for left in [-1, 0, 300_000, 360_000] {
+        let mut late = job("m1", "Hi");
+        late["deadline_ms"] = json!(now_ms() as i64 + left);
+        assert_eq!(
+            post(&format!("{url}/run"), &late),
+            (504, "too close to the job's deadline to deliver".into()),
+            "{left} ms left"
+        );
+    }
     assert!(backend.asked.lock().unwrap().is_empty());
 }
 
