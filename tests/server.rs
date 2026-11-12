@@ -350,3 +350,54 @@ fn refuses_a_body_over_its_limit_and_a_job_id_it_would_not_send() {
     }
     assert!(backend.asked.lock().unwrap().is_empty());
 }
+
+#[test]
+fn a_job_that_fails_while_a_duplicate_waits_is_still_asked_once_at_a_time() {
+    let calls = Arc::new(Mutex::new(0));
+    let counted = calls.clone();
+    let backend = fake_backend(Box::new(move |_| {
+        let call = {
+            let mut calls = counted.lock().unwrap();
+            *calls += 1;
+            *calls
+        };
+        thread::sleep(Duration::from_millis(300));
+        if call == 1 {
+            (500, "busy".into())
+        } else {
+            completion(&format!("answer {call}"))
+        }
+    }));
+    let url = start(&backend, None);
+    let first = {
+        let url = url.clone();
+        thread::spawn(move || post(&format!("{url}/run"), &job("l1", "Hi")))
+    };
+    thread::sleep(Duration::from_millis(100));
+    // Waits on the first, which fails, then asks the model itself.
+    let waiting = {
+        let url = url.clone();
+        thread::spawn(move || post(&format!("{url}/run"), &job("l1", "Hi")))
+    };
+    thread::sleep(Duration::from_millis(350));
+    // Arrives while the second is asking: it waits for that answer.
+    let third = post(&format!("{url}/run"), &job("l1", "Hi"));
+    assert_eq!(first.join().unwrap().0, 502);
+    let second = waiting.join().unwrap();
+    assert_eq!(second.0, 200);
+    assert_eq!(third, second);
+    assert_eq!(*calls.lock().unwrap(), 2);
+}
+
+#[test]
+fn does_not_ask_the_model_for_a_job_past_its_deadline() {
+    let backend = fake_backend(answering("too late"));
+    let url = start(&backend, None);
+    let mut late = job("m1", "Hi");
+    late["deadline_ms"] = json!(now_ms() - 1);
+    assert_eq!(
+        post(&format!("{url}/run"), &late),
+        (504, "the job's deadline has passed".into())
+    );
+    assert!(backend.asked.lock().unwrap().is_empty());
+}

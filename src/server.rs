@@ -197,11 +197,8 @@ impl State {
                 *output = Some(body.clone());
                 Answer::json(body)
             }
-            Err(answer) => {
-                // Nothing to keep: the next arrival asks the model again.
-                self.jobs.forget(&ask.job, &slot);
-                answer
-            }
+            // Nothing to keep: the next arrival asks the model again, in this job's turn.
+            Err(answer) => answer,
         };
         eprintln!("job {:?}: {}", ask.job, answer.status);
         answer
@@ -229,11 +226,14 @@ impl State {
     /// Asks the model, until the job's deadline at the latest.
     fn complete(&self, prompt: &Prompt, deadline_ms: Option<u64>) -> Result<String, Answer> {
         let backend = &self.config.backend;
-        let timeout = deadline_ms
-            .map(|ms| {
-                Duration::from_millis(ms.saturating_sub(now_ms())).max(Duration::from_secs(1))
-            })
-            .map_or(self.config.timeout, |left| left.min(self.config.timeout));
+        let mut timeout = self.config.timeout;
+        if let Some(deadline_ms) = deadline_ms {
+            let left = deadline_ms.saturating_sub(now_ms());
+            if left == 0 {
+                return Err(Answer::reason(504, "the job's deadline has passed"));
+            }
+            timeout = timeout.min(Duration::from_millis(left));
+        }
         let url = format!("{}/chat/completions", backend.url.trim_end_matches('/'));
         let mut request = self.agent.post(&url);
         if let Some(key) = &backend.api_key {
@@ -303,8 +303,8 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// Each paid job's output once the model gave it, the most recent `KEPT_JOBS` of them. Kept
-/// in memory only, so a restart forgets them.
+/// Each paid job's turn at the model, and its output once the model gave it, for the most
+/// recent `KEPT_JOBS` jobs. Kept in memory only, so a restart forgets them.
 #[derive(Default)]
 struct Jobs {
     inner: Mutex<(HashMap<String, Slot>, VecDeque<String>)>,
@@ -322,21 +322,16 @@ impl Jobs {
         let slot = Slot::default();
         slots.insert(job.to_string(), slot.clone());
         order.push_back(job.to_string());
+        // Over the limit, the oldest job nobody is running goes: one that is running would
+        // be asked again on its next arrival.
         if order.len() > KEPT_JOBS
-            && let Some(oldest) = order.pop_front()
+            && let Some(at) = order
+                .iter()
+                .position(|j| slots.get(j).is_some_and(|s| Arc::strong_count(s) == 1))
+            && let Some(oldest) = order.remove(at)
         {
             slots.remove(&oldest);
         }
         slot
-    }
-
-    /// Drops a job's slot that holds no output, unless another arrival replaced it.
-    fn forget(&self, job: &str, slot: &Slot) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let (slots, order) = &mut *inner;
-        if slots.get(job).is_some_and(|kept| Arc::ptr_eq(kept, slot)) {
-            slots.remove(job);
-            order.retain(|j| j != job);
-        }
     }
 }
