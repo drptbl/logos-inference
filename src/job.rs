@@ -15,9 +15,11 @@ pub struct Pricing {
 #[derive(Debug, PartialEq)]
 pub struct Refusal(pub String);
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// One chat message, as the backend takes it and a chat request gives it.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Message {
-    pub role: String,
+    pub role: Role,
     pub content: String,
 }
 
@@ -53,20 +55,13 @@ impl Prompt {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChatRequest {
-    messages: Vec<ChatMessage>,
+    messages: Vec<Message>,
     max_tokens: Option<u32>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ChatMessage {
-    role: Role,
-    content: String,
-}
-
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
-enum Role {
+pub enum Role {
     System,
     User,
     Assistant,
@@ -86,7 +81,7 @@ pub fn parse(input: &Value, pricing: &Pricing, system: Option<&str>) -> Result<P
     };
     let mut messages: Vec<Message> = system
         .map(|s| Message {
-            role: "system".into(),
+            role: Role::System,
             content: s.into(),
         })
         .into_iter()
@@ -111,20 +106,10 @@ pub fn parse(input: &Value, pricing: &Pricing, system: Option<&str>) -> Result<P
                 }
                 max_tokens = asked;
             }
-            messages.extend(request.messages.into_iter().map(|m| {
-                Message {
-                    role: match m.role {
-                        Role::System => "system",
-                        Role::User => "user",
-                        Role::Assistant => "assistant",
-                    }
-                    .into(),
-                    content: m.content,
-                }
-            }));
+            messages.extend(request.messages);
         }
         _ => messages.push(Message {
-            role: "user".into(),
+            role: Role::User,
             content: text.into(),
         }),
     }

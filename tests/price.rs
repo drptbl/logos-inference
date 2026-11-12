@@ -1,4 +1,4 @@
-use logos_inference::job::{Pricing, Refusal, parse};
+use logos_inference::job::{Pricing, Refusal, Role, parse};
 use serde_json::json;
 
 const PRICING: Pricing = Pricing {
@@ -32,7 +32,7 @@ fn a_chat_request_is_read_as_messages_with_its_own_cap() {
 #[test]
 fn the_offers_system_prompt_goes_first_and_is_paid_for() {
     let prompt = parse(&text("Hi"), &PRICING, Some("You are terse.")).unwrap();
-    assert_eq!(prompt.messages[0].role, "system");
+    assert_eq!(prompt.messages[0].role, Role::System);
     assert_eq!(prompt.messages[0].content, "You are terse.");
     assert_eq!(prompt.messages[1].content, "Hi");
     // (4 + 4) + (1 + 4) input tokens.
