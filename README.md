@@ -8,7 +8,7 @@ Early release. Logos is on testnet (`v0.3`) and is not meant for real funds yet.
 
 ## Run a provider
 
-You need a model behind an OpenAI-compatible chat completions API (Ollama, llama.cpp's `llama-server`, vLLM, LM Studio or a hosted one) and the [logos-agents requirements](https://github.com/drptbl/logos-agents#requirements). The output cap is sent as `max_tokens`, so a hosted model that only takes `max_completion_tokens` declines every job for now.
+You need a model behind an OpenAI-compatible chat completions API (Ollama, llama.cpp's `llama-server`, oMLX, vLLM, LM Studio or a hosted one) and the [logos-agents requirements](https://github.com/drptbl/logos-agents#requirements).
 
 ```bash
 cargo build --release
@@ -28,11 +28,14 @@ logos-agents provide offers.toml
 | `--model` | the model, as the backend names it |
 | `--input-lepta-per-token`, `--output-lepta-per-token` | the rates |
 | `--max-tokens` | the most output tokens a job gets, default 512 |
+| `--max-tokens-field` | how the cap is sent: `max_tokens` (default), or `max_completion_tokens` for a hosted model that refuses `max_tokens` |
 | `--system` | a system prompt put before every job, paid for as input |
 | `--listen` | default `127.0.0.1:8080` |
 | `--timeout-s` | the longest a job waits on the model, default 600 |
 
-If the backend needs an API key, set `LOGOS_INFERENCE_API_KEY`. It is sent as a bearer token and never logged.
+logos-agents `v0.4.0` stops waiting on a job 6 minutes before its escrow deadline, and so does the model. Give the offer's `deliver_within_s` the model's time plus those 6 minutes.
+
+If the backend needs an API key, as oMLX does, set `LOGOS_INFERENCE_API_KEY`. It is sent as a bearer token and never logged.
 
 An answer too big for a chat message, about 60 KB or some 15,000 tokens, is delivered through Logos Storage. With a large `--max-tokens`, give `provide` a files root (`LOGOS_MCP_FILES_ROOT`), or such a job is declined and refunded.
 
@@ -63,7 +66,7 @@ Input tokens are estimated, not counted by the model's tokenizer: each message's
 
 1. `/quote` gets the request and answers its price, or a reason to turn it away
 2. once the buyer pays into escrow, `/run` gets the job, asks the model and answers its text, which logos-agents delivers and claims
-3. if the model refuses the prompt (`400`, `413` or `422`, e.g. too long for its context), `/run` declines and the buyer is refunded
+3. if the model refuses the prompt (`400`, `413` or `422`, e.g. too long for its context), or spends the whole cap without answering (a thinking model can), `/run` declines and the buyer is refunded
 4. a job paid below its price at the handler's rates is declined the same way, so an offer served without the quote handler can't run at its fallback price
 5. if the backend is down, times out or answers anything else, `/run` asks logos-agents to try again, which it does while there's time, then declines
 
