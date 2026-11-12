@@ -64,7 +64,8 @@ Input tokens are estimated, not counted by the model's tokenizer: each message's
 1. `/quote` gets the request and answers its price, or a reason to turn it away
 2. once the buyer pays into escrow, `/run` gets the job, asks the model and answers its text, which logos-agents delivers and claims
 3. if the model refuses the prompt (`400`, `413` or `422`, e.g. too long for its context), `/run` declines and the buyer is refunded
-4. if the backend is down, times out or answers anything else, `/run` asks logos-agents to try again, which it does while there's time, then declines
+4. a job paid below its price at the handler's rates is declined the same way, so an offer served without the quote handler can't run at its fallback price
+5. if the backend is down, times out or answers anything else, `/run` asks logos-agents to try again, which it does while there's time, then declines
 
 A job that arrives twice gets the same answer from one model call. Answers are kept in memory, so a restart forgets them.
 
