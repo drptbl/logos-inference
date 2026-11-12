@@ -17,6 +17,26 @@ pub struct Backend {
     pub url: String,
     pub model: String,
     pub api_key: Option<String>,
+    pub token_field: TokenField,
+}
+
+/// The request field that caps the output. Most backends take `max_tokens`; some hosted
+/// models take only `max_completion_tokens`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum TokenField {
+    #[value(name = "max_tokens")]
+    MaxTokens,
+    #[value(name = "max_completion_tokens")]
+    MaxCompletionTokens,
+}
+
+impl TokenField {
+    fn name(self) -> &'static str {
+        match self {
+            TokenField::MaxTokens => "max_tokens",
+            TokenField::MaxCompletionTokens => "max_completion_tokens",
+        }
+    }
 }
 
 pub struct Config {
@@ -30,6 +50,10 @@ pub struct Config {
 
 /// The largest request body read. logos-agents caps an input at 8 MiB.
 const MAX_BODY: u64 = 16 << 20;
+/// How long before a job's deadline logos-agents v0.4.0 stops waiting on a handler: its
+/// deadline margin (5 minutes) and the time a delivery needs to land (1 minute). An answer
+/// after that can't be delivered, so the model isn't kept at it.
+const DELIVERY_MARGIN_MS: u64 = 6 * 60 * 1000;
 /// Paid jobs whose output is kept, for a job that arrives again.
 const KEPT_JOBS: usize = 10_000;
 
@@ -223,14 +247,17 @@ impl State {
         Ok(prompt)
     }
 
-    /// Asks the model, until the job's deadline at the latest.
+    /// Asks the model, until logos-agents stops waiting for this job at the latest.
     fn complete(&self, prompt: &Prompt, deadline_ms: Option<u64>) -> Result<String, Answer> {
         let backend = &self.config.backend;
         let mut timeout = self.config.timeout;
         if let Some(deadline_ms) = deadline_ms {
-            let left = deadline_ms.saturating_sub(now_ms());
+            let left = deadline_ms.saturating_sub(now_ms() + DELIVERY_MARGIN_MS);
             if left == 0 {
-                return Err(Answer::reason(504, "the job's deadline has passed"));
+                return Err(Answer::reason(
+                    504,
+                    "too close to the job's deadline to deliver",
+                ));
             }
             timeout = timeout.min(Duration::from_millis(left));
         }
@@ -246,7 +273,7 @@ impl State {
             .send_json(json!({
                 "model": backend.model,
                 "messages": prompt.messages,
-                "max_tokens": prompt.max_tokens,
+                backend.token_field.name(): prompt.max_tokens,
                 "stream": false,
             }));
         let mut response = match sent {
@@ -292,6 +319,11 @@ impl State {
             .and_then(Value::as_str)
         {
             Some(text) if !text.is_empty() => Ok(text.to_string()),
+            // The cap ran out first, e.g. on a thinking model's reasoning: another try would
+            // spend it again, so decline, which refunds the buyer.
+            _ if body.pointer("/choices/0/finish_reason") == Some(&json!("length")) => Err(
+                Answer::reason(422, "the model used its whole output cap without answering"),
+            ),
             _ => Err(Answer::reason(502, "the model backend gave no answer")),
         }
     }

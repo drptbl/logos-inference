@@ -1,7 +1,7 @@
 //! The handler contract logos-agents' `provide` speaks, against a fake OpenAI-compatible backend.
 
 use logos_inference::job::Pricing;
-use logos_inference::server::{Backend, Config, Server};
+use logos_inference::server::{Backend, Config, Server, TokenField};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -53,6 +53,10 @@ fn answering(text: &'static str) -> Reply {
 }
 
 fn start(backend: &FakeBackend, api_key: Option<&str>) -> String {
+    start_with(backend, api_key, TokenField::MaxTokens)
+}
+
+fn start_with(backend: &FakeBackend, api_key: Option<&str>, token_field: TokenField) -> String {
     let config = Config {
         pricing: Pricing {
             input_lepta_per_token: 10,
@@ -63,6 +67,7 @@ fn start(backend: &FakeBackend, api_key: Option<&str>) -> String {
             url: backend.url.clone(),
             model: "tiny-model".into(),
             api_key: api_key.map(Into::into),
+            token_field,
         },
         system: None,
         timeout: Duration::from_secs(30),
@@ -241,7 +246,8 @@ fn gives_up_on_the_model_at_the_jobs_deadline() {
     }));
     let url = start(&backend, None);
     let mut late = job("f1", "Hi");
-    late["deadline_ms"] = json!(now_ms() + 1_000);
+    // logos-agents stops waiting 6 minutes before the deadline: a second is left of that.
+    late["deadline_ms"] = json!(now_ms() + 361_000);
     let started = Instant::now();
     assert_eq!(
         post(&format!("{url}/run"), &late),
@@ -390,14 +396,56 @@ fn a_job_that_fails_while_a_duplicate_waits_is_still_asked_once_at_a_time() {
 }
 
 #[test]
-fn does_not_ask_the_model_for_a_job_past_its_deadline() {
+fn does_not_ask_the_model_for_a_job_too_close_to_its_deadline() {
     let backend = fake_backend(answering("too late"));
     let url = start(&backend, None);
-    let mut late = job("m1", "Hi");
-    late["deadline_ms"] = json!(now_ms() - 1);
-    assert_eq!(
-        post(&format!("{url}/run"), &late),
-        (504, "the job's deadline has passed".into())
-    );
+    for left in [-1, 0, 300_000, 360_000] {
+        let mut late = job("m1", "Hi");
+        late["deadline_ms"] = json!(now_ms() as i64 + left);
+        assert_eq!(
+            post(&format!("{url}/run"), &late),
+            (504, "too close to the job's deadline to deliver".into()),
+            "{left} ms left"
+        );
+    }
     assert!(backend.asked.lock().unwrap().is_empty());
+}
+
+#[test]
+fn declines_a_job_whose_answer_the_cap_cut_off_before_it_began() {
+    // A thinking model can spend the whole cap reasoning and answer nothing: asking again
+    // would spend it again.
+    let backend = fake_backend(Box::new(|_| {
+        (200, json!({"choices": [{"index": 0, "message": {"role": "assistant", "content": ""}, "finish_reason": "length"}]}).to_string())
+    }));
+    let url = start(&backend, None);
+    assert_eq!(
+        post(&format!("{url}/run"), &job("n1", "Hi")),
+        (
+            422,
+            "the model used its whole output cap without answering".into()
+        )
+    );
+}
+
+#[test]
+fn names_the_output_cap_as_the_backend_takes_it() {
+    let backend = fake_backend(answering("ok"));
+    let url = start_with(&backend, None, TokenField::MaxCompletionTokens);
+    assert_eq!(post(&format!("{url}/run"), &job("o1", "Hi")).0, 200);
+    let asked = &backend.asked.lock().unwrap()[0].0;
+    assert_eq!(asked["max_completion_tokens"], json!(64));
+    assert!(asked.get("max_tokens").is_none(), "{asked}");
+}
+
+#[test]
+fn asks_to_be_retried_when_the_model_stops_with_nothing() {
+    let backend = fake_backend(Box::new(|_| {
+        (200, json!({"choices": [{"index": 0, "message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}]}).to_string())
+    }));
+    let url = start(&backend, None);
+    assert_eq!(
+        post(&format!("{url}/run"), &job("p1", "Hi")),
+        (502, "the model backend gave no answer".into())
+    );
 }

@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -42,6 +43,15 @@ def price(contents, max_tokens):
     at the input rate, and the output cap at the output rate."""
     tokens = sum(math.ceil(len(c.encode()) / 4) + 4 for c in contents)
     return str(tokens * INPUT_RATE + max_tokens * OUTPUT_RATE)
+
+
+def write_offers(source, path, service, base):
+    """The repo's offer, as a provider would serve it, pointed at this run's server."""
+    with open(source, "rb") as f:
+        offer = tomllib.load(f)["offer"][0]
+    offer.update(service_id=service, handler=f"{base}/run", quote_handler=f"{base}/quote")
+    with open(path, "w") as f:
+        f.write("[[offer]]\n" + "".join(f"{key} = {json.dumps(value, ensure_ascii=False)}\n" for key, value in offer.items()))
 
 
 def serve_model(args, logs):
@@ -71,6 +81,8 @@ def main():
     ap.add_argument("--bin", default=os.path.join(REPO, "target", "debug", "logos-inference"))
     ap.add_argument("--backend", default="http://127.0.0.1:11434/v1", help="the OpenAI-compatible API, e.g. Ollama's")
     ap.add_argument("--model", required=True, help="the model the backend runs, e.g. qwen2.5:0.5b")
+    ap.add_argument("--offers", default=os.path.join(REPO, "offers.toml"),
+                    help="the offer to serve, whose service id and handler URLs this run replaces")
     ap.add_argument("--service", help="the offer's service id (default: inference/<model>/v1)")
     ap.add_argument("--timeout", type=int, default=600, help="seconds to wait for each step")
     ap.add_argument("--poll", type=int, default=3, help="seconds between checks")
@@ -90,10 +102,7 @@ def main():
     inference, base = serve_model(args, logs)
     demo.log(f"[provider] logos-inference serving {args.model} from {args.backend} on {base}")
     offers = os.path.join(logs, "offers.toml")
-    with open(offers, "w") as f:
-        f.write(f'[[offer]]\nservice_id = {json.dumps(service)}\ntag = "inference"\n'
-                f'price_lepta = "1"\ndeliver_within_s = 600\nhandler = "{base}/run"\n'
-                f'quote_handler = "{base}/quote"\nmax_jobs = 2\n')
+    write_offers(args.offers, offers, service, base)
 
     wallet = sides.provider_wallet
     provider_env = dict(
