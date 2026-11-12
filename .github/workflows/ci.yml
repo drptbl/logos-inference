@@ -18,6 +18,8 @@ env:
   # checkout for the demo helpers in scripts/.
   LOGOS_AGENTS_VERSION: v0.4.0
   LOGOS_AGENTS_COMMIT: b50270fc5d073e38327e8d70417266fdda268fc9
+  # The x86_64 Linux release tarball's sha256, pinned here rather than read from the release.
+  LOGOS_AGENTS_SHA256: c2a16df79dc935318fe5875f9247122a22c52033262d1151ad0b779b87adc658
   # The demo's model: Qwen2.5 0.5B Instruct, Q4_K_M, at a fixed revision.
   MODEL: qwen2.5-0.5b-instruct
   MODEL_URL: https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/9217f5db79a29953eb74d5343926648285ec7e67/qwen2.5-0.5b-instruct-q4_k_m.gguf
@@ -66,8 +68,7 @@ jobs:
           cd "$dir"
           url="https://github.com/drptbl/logos-agents/releases/download/$LOGOS_AGENTS_VERSION/$name.tar.gz"
           curl -fsSL --retry 3 -o "$name.tar.gz" "$url"
-          curl -fsSL --retry 3 -o "$name.tar.gz.sha256" "$url.sha256"
-          sha256sum -c "$name.tar.gz.sha256"
+          echo "$LOGOS_AGENTS_SHA256  $name.tar.gz" | sha256sum -c
           tar -xzf "$name.tar.gz"
           echo "$dir/$name" >> "$GITHUB_PATH"
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
