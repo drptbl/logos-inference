@@ -1,7 +1,7 @@
 //! The handler contract logos-agents' `provide` speaks, against a fake OpenAI-compatible backend.
 
 use logos_inference::job::Pricing;
-use logos_inference::server::{Backend, Config, Server};
+use logos_inference::server::{Backend, Config, Server, TokenField};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -53,6 +53,10 @@ fn answering(text: &'static str) -> Reply {
 }
 
 fn start(backend: &FakeBackend, api_key: Option<&str>) -> String {
+    start_with(backend, api_key, TokenField::MaxTokens)
+}
+
+fn start_with(backend: &FakeBackend, api_key: Option<&str>, token_field: TokenField) -> String {
     let config = Config {
         pricing: Pricing {
             input_lepta_per_token: 10,
@@ -63,6 +67,7 @@ fn start(backend: &FakeBackend, api_key: Option<&str>) -> String {
             url: backend.url.clone(),
             model: "tiny-model".into(),
             api_key: api_key.map(Into::into),
+            token_field,
         },
         system: None,
         timeout: Duration::from_secs(30),
@@ -421,4 +426,14 @@ fn declines_a_job_whose_answer_the_cap_cut_off_before_it_began() {
             "the model used its whole output cap without answering".into()
         )
     );
+}
+
+#[test]
+fn names_the_output_cap_as_the_backend_takes_it() {
+    let backend = fake_backend(answering("ok"));
+    let url = start_with(&backend, None, TokenField::MaxCompletionTokens);
+    assert_eq!(post(&format!("{url}/run"), &job("o1", "Hi")).0, 200);
+    let asked = &backend.asked.lock().unwrap()[0].0;
+    assert_eq!(asked["max_completion_tokens"], json!(64));
+    assert!(asked.get("max_tokens").is_none(), "{asked}");
 }

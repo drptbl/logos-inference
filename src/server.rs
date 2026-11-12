@@ -17,6 +17,26 @@ pub struct Backend {
     pub url: String,
     pub model: String,
     pub api_key: Option<String>,
+    pub token_field: TokenField,
+}
+
+/// The request field that caps the output. Most backends take `max_tokens`; some hosted
+/// models take only `max_completion_tokens`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum TokenField {
+    #[value(name = "max_tokens")]
+    MaxTokens,
+    #[value(name = "max_completion_tokens")]
+    MaxCompletionTokens,
+}
+
+impl TokenField {
+    fn name(self) -> &'static str {
+        match self {
+            TokenField::MaxTokens => "max_tokens",
+            TokenField::MaxCompletionTokens => "max_completion_tokens",
+        }
+    }
 }
 
 pub struct Config {
@@ -253,7 +273,7 @@ impl State {
             .send_json(json!({
                 "model": backend.model,
                 "messages": prompt.messages,
-                "max_tokens": prompt.max_tokens,
+                backend.token_field.name(): prompt.max_tokens,
                 "stream": false,
             }));
         let mut response = match sent {

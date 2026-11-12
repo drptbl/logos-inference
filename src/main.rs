@@ -1,6 +1,6 @@
 use clap::Parser;
 use logos_inference::job::Pricing;
-use logos_inference::server::{Backend, Config, Server};
+use logos_inference::server::{Backend, Config, Server, TokenField};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -26,6 +26,10 @@ struct Args {
     /// so an answer stays well under the 8 MiB logos-agents delivers.
     #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u32).range(1..=262_144))]
     max_tokens: u32,
+    /// The request field that caps the output: max_completion_tokens for hosted models that
+    /// refuse max_tokens.
+    #[arg(long, value_enum, default_value_t = TokenField::MaxTokens)]
+    max_tokens_field: TokenField,
     /// A system prompt put before every job's messages, and paid for as input.
     #[arg(long)]
     system: Option<String>,
@@ -56,6 +60,7 @@ fn main() -> ExitCode {
             api_key: std::env::var("LOGOS_INFERENCE_API_KEY")
                 .ok()
                 .filter(|k| !k.is_empty()),
+            token_field: args.max_tokens_field,
         },
         system: args.system,
         timeout: Duration::from_secs(args.timeout_s),
