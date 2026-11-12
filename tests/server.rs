@@ -437,3 +437,15 @@ fn names_the_output_cap_as_the_backend_takes_it() {
     assert_eq!(asked["max_completion_tokens"], json!(64));
     assert!(asked.get("max_tokens").is_none(), "{asked}");
 }
+
+#[test]
+fn asks_to_be_retried_when_the_model_stops_with_nothing() {
+    let backend = fake_backend(Box::new(|_| {
+        (200, json!({"choices": [{"index": 0, "message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}]}).to_string())
+    }));
+    let url = start(&backend, None);
+    assert_eq!(
+        post(&format!("{url}/run"), &job("p1", "Hi")),
+        (502, "the model backend gave no answer".into())
+    );
+}
