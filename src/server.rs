@@ -52,7 +52,7 @@ impl Server {
             .max_redirects(0)
             .build()
             .into();
-        let jobs = Jobs::default();
+        let jobs = Jobs::new(KEPT_JOBS);
         Ok(Server {
             http,
             state: Arc::new(State {
@@ -305,14 +305,21 @@ fn now_ms() -> u64 {
 
 /// Each paid job's turn at the model, and its output once the model gave it, for the most
 /// recent `KEPT_JOBS` jobs. Kept in memory only, so a restart forgets them.
-#[derive(Default)]
 struct Jobs {
     inner: Mutex<(HashMap<String, Slot>, VecDeque<String>)>,
+    kept: usize,
 }
 
 type Slot = Arc<Mutex<Option<Value>>>;
 
 impl Jobs {
+    fn new(kept: usize) -> Jobs {
+        Jobs {
+            inner: Mutex::default(),
+            kept,
+        }
+    }
+
     fn slot(&self, job: &str) -> Slot {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let (slots, order) = &mut *inner;
@@ -324,7 +331,7 @@ impl Jobs {
         order.push_back(job.to_string());
         // Over the limit, the oldest job nobody is running goes: one that is running would
         // be asked again on its next arrival.
-        if order.len() > KEPT_JOBS
+        if order.len() > self.kept
             && let Some(at) = order
                 .iter()
                 .position(|j| slots.get(j).is_some_and(|s| Arc::strong_count(s) == 1))
@@ -333,5 +340,25 @@ impl Jobs {
             slots.remove(&oldest);
         }
         slot
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn over_the_limit_the_oldest_job_nobody_runs_goes() {
+        let jobs = Jobs::new(2);
+        let running = jobs.slot("a");
+        drop(jobs.slot("b"));
+        drop(jobs.slot("c"));
+        let kept = jobs.inner.lock().unwrap();
+        assert!(kept.0.contains_key("a"), "a running job was dropped");
+        assert!(!kept.0.contains_key("b"));
+        assert!(kept.0.contains_key("c"));
+        assert_eq!(kept.1, ["a", "c"]);
+        drop(kept);
+        assert!(Arc::ptr_eq(&running, &jobs.slot("a")));
     }
 }
