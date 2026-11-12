@@ -87,7 +87,7 @@ def main():
     demo.on_devnet(sides)
 
     logs = tempfile.mkdtemp(prefix="logos-inference-demo-")
-    model, base = serve_model(args, logs)
+    inference, base = serve_model(args, logs)
     demo.log(f"[provider] logos-inference serving {args.model} from {args.backend} on {base}")
     offers = os.path.join(logs, "offers.toml")
     with open(offers, "w") as f:
@@ -105,12 +105,13 @@ def main():
         LOGOS_MCP_DISCOVERY_BOOTSTRAP=sides.bootstrap,
         LOGOS_AGENTS_FOLLOW_THROUGH_SECS=str(args.poll),
     )
-    provider = subprocess.Popen([args.agents_bin, "provide", offers], env=provider_env, stdin=subprocess.DEVNULL,
-                                stdout=subprocess.DEVNULL, stderr=open(os.path.join(logs, "provider.log"), "w"))
-    demo.log(f"[provider] logos-agents provide {service}")
-    buyer = demo.start("buyer", args.agents_bin, sides.buyer_session, sides.buyer_wallet, sides.bootstrap,
-                       "logos.dev", logs)
+    provider = buyer = None
     try:
+        provider = subprocess.Popen([args.agents_bin, "provide", offers], env=provider_env, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=open(os.path.join(logs, "provider.log"), "w"))
+        demo.log(f"[provider] logos-agents provide {service}")
+        buyer = demo.start("buyer", args.agents_bin, sides.buyer_session, sides.buyer_wallet, sides.bootstrap,
+                           "logos.dev", logs)
         def find():
             _, body = buyer.tool("service_find", service_id=service)
             return next((p for p in body.get("providers", []) if not p["this_node"]), None)
@@ -149,10 +150,12 @@ def main():
             sys.exit(f"a request over the cap came back as {turned}")
         demo.log(f"[provider] turned away a request over the cap: {turned['reason']!r}")
     finally:
-        provider.terminate()
-        provider.wait(timeout=60)
-        buyer.close()
-        model.terminate()
+        inference.terminate()
+        if buyer:
+            buyer.close()
+        if provider:
+            provider.terminate()
+            provider.wait(timeout=60)
     print(f"DEMO: PASS (logs in {logs})")
 
 
