@@ -22,8 +22,9 @@ struct Args {
     /// Lepta per output token, charged for the whole output cap.
     #[arg(long)]
     output_lepta_per_token: u64,
-    /// The most output tokens a job gets, and what it gets when it doesn't ask.
-    #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u32).range(1..))]
+    /// The most output tokens a job gets, and what it gets when it doesn't ask. Up to 262144,
+    /// so an answer stays well under the 8 MiB logos-agents delivers.
+    #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u32).range(1..=262_144))]
     max_tokens: u32,
     /// A system prompt put before every job's messages, and paid for as input.
     #[arg(long)]
