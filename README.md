@@ -8,11 +8,10 @@ Early release. Logos is on testnet (`v0.3`) and is not meant for real funds yet.
 
 ## Run a provider
 
-You need a model behind an OpenAI-compatible chat completions API (Ollama, llama.cpp's `llama-server`, oMLX, vLLM, LM Studio or a hosted one) and the [logos-agents requirements](https://github.com/drptbl/logos-agents#requirements).
+You need a model behind an OpenAI-compatible chat completions API (Ollama, llama.cpp's `llama-server`, oMLX, vLLM, LM Studio or a hosted one), logos-agents `v0.4.0` ([install](https://github.com/drptbl/logos-agents#install)) and its [requirements](https://github.com/drptbl/logos-agents#requirements). With logos-inference [installed](#install):
 
 ```bash
-cargo build --release
-./target/release/logos-inference --backend http://127.0.0.1:11434/v1 --model qwen2.5:0.5b \
+logos-inference --backend http://127.0.0.1:11434/v1 --model qwen2.5:0.5b \
   --input-lepta-per-token 10 --output-lepta-per-token 100 --max-tokens 512
 ```
 
@@ -38,6 +37,28 @@ logos-agents `v0.4.0` stops waiting on a job 6 minutes before its escrow deadlin
 If the backend needs an API key, as oMLX or a hosted API may, set `LOGOS_INFERENCE_API_KEY`. It is sent as a bearer token and never logged.
 
 An answer too big for a chat message, about 60 KB or some 15,000 tokens, is delivered through Logos Storage. With a large `--max-tokens`, give `provide` a files root (`LOGOS_MCP_FILES_ROOT`), or such a job is declined and refunded.
+
+## Install
+
+Download the binary for your platform from the [latest release](https://github.com/drptbl/logos-inference/releases/latest):
+
+1. macOS, Apple Silicon => `aarch64-apple-darwin`
+2. Linux x86_64 => `x86_64-unknown-linux-gnu`
+3. Linux arm64 => `aarch64-unknown-linux-gnu`
+
+Check it against its `.sha256` before you run it. On macOS:
+
+```bash
+v=v0.1.0 target=aarch64-apple-darwin
+curl -LO https://github.com/drptbl/logos-inference/releases/download/$v/logos-inference-$v-$target.tar.gz
+curl -LO https://github.com/drptbl/logos-inference/releases/download/$v/logos-inference-$v-$target.tar.gz.sha256
+shasum -a 256 -c logos-inference-$v-$target.tar.gz.sha256
+tar xzf logos-inference-$v-$target.tar.gz
+```
+
+On Linux, use `sha256sum -c` instead of `shasum -a 256 -c`. The binary is `logos-inference-$v-$target/logos-inference`.
+
+To build it yourself instead, `cargo build --release` in a clone of this repository. The binary is then `target/release/logos-inference`.
 
 ## What a buyer sends
 
