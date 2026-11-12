@@ -51,7 +51,7 @@ def write_offers(source, path, service, base):
         offer = tomllib.load(f)["offer"][0]
     offer.update(service_id=service, handler=f"{base}/run", quote_handler=f"{base}/quote")
     with open(path, "w") as f:
-        f.write("[[offer]]\n" + "".join(f"{key} = {json.dumps(value)}\n" for key, value in offer.items()))
+        f.write("[[offer]]\n" + "".join(f"{key} = {json.dumps(value, ensure_ascii=False)}\n" for key, value in offer.items()))
 
 
 def serve_model(args, logs):
