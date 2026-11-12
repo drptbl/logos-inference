@@ -401,3 +401,20 @@ fn does_not_ask_the_model_for_a_job_past_its_deadline() {
     );
     assert!(backend.asked.lock().unwrap().is_empty());
 }
+
+#[test]
+fn declines_a_job_whose_answer_the_cap_cut_off_before_it_began() {
+    // A thinking model can spend the whole cap reasoning and answer nothing: asking again
+    // would spend it again.
+    let backend = fake_backend(Box::new(|_| {
+        (200, json!({"choices": [{"index": 0, "message": {"role": "assistant", "content": ""}, "finish_reason": "length"}]}).to_string())
+    }));
+    let url = start(&backend, None);
+    assert_eq!(
+        post(&format!("{url}/run"), &job("n1", "Hi")),
+        (
+            422,
+            "the model used its whole output cap without answering".into()
+        )
+    );
+}

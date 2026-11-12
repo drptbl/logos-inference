@@ -292,6 +292,11 @@ impl State {
             .and_then(Value::as_str)
         {
             Some(text) if !text.is_empty() => Ok(text.to_string()),
+            // The cap ran out first, e.g. on a thinking model's reasoning: another try would
+            // spend it again, so decline, which refunds the buyer.
+            _ if body.pointer("/choices/0/finish_reason") == Some(&json!("length")) => Err(
+                Answer::reason(422, "the model used its whole output cap without answering"),
+            ),
             _ => Err(Answer::reason(502, "the model backend gave no answer")),
         }
     }
