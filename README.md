@@ -8,7 +8,7 @@ Early release. Logos is on testnet (`v0.3`) and is not meant for real funds yet.
 
 ## Run a provider
 
-You need a model behind an OpenAI-compatible API (Ollama, llama.cpp's `llama-server`, vLLM, LM Studio or a hosted one) and the [logos-agents requirements](https://github.com/drptbl/logos-agents#requirements).
+You need a model behind an OpenAI-compatible chat completions API (Ollama, llama.cpp's `llama-server`, vLLM, LM Studio or a hosted one) and the [logos-agents requirements](https://github.com/drptbl/logos-agents#requirements). The output cap is sent as `max_tokens`, so a hosted model that only takes `max_completion_tokens` declines every job for now.
 
 ```bash
 cargo build --release

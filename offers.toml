@@ -1,7 +1,7 @@
 # One model served over Logos with logos-agents v0.4.0. Start logos-inference first, then
 # `logos-agents provide offers.toml`. The service id names the model.
 [[offer]]
-service_id = "inference/qwen2.5-0.5b-instruct/v1"
+service_id = "inference/qwen2.5:0.5b/v1"
 tag = "inference"
 # The quote handler prices each request, so this is only a fallback logos-agents requires.
 price_lepta = "1"
