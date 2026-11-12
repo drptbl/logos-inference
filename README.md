@@ -34,6 +34,8 @@ logos-agents provide offers.toml
 
 If the backend needs an API key, set `LOGOS_INFERENCE_API_KEY`. It is sent as a bearer token and never logged.
 
+An answer too big for a chat message, about 60 KB or some 15,000 tokens, is delivered through Logos Storage. With a large `--max-tokens`, give `provide` a files root (`LOGOS_MCP_FILES_ROOT`), or such a job is declined and refunded.
+
 ## What a buyer sends
 
 The job's input is text, one of:
