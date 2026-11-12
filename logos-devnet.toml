@@ -1,0 +1,24 @@
+# A local LEZ chain for the demo: `logos-devnet up`, then scripts/demo.py. See
+# https://github.com/drptbl/logos-devnet.
+
+# A devnet of this repo's own, on a free port, next to any other project's.
+home = ".logos-devnet"
+
+[devnet]
+port = 0
+
+[programs]
+# logos-escrow's released guest binary (image 1d646179…), the one logos-agents v0.4.0 uses,
+# downloaded once and deployed only if its sha256 matches.
+escrow = { url = "https://github.com/drptbl/logos-escrow/releases/download/v0.1.0/logos_escrow.bin", sha256 = "e39f35af4f8b93ee5e1ca0ecb6c4f524c43c4446a8a6ad56d8c7d3fde7c3deb5" }
+
+# One logosctl session per side of a job, under the names logos-agents' demo helpers take.
+[sessions.agents-provider]
+modules = ["chat_module", "libp2p_module"]
+
+[sessions.agents-buyer]
+modules = ["chat_module", "libp2p_module"]
+
+# A local delivery node and discovery bootstrap, so chat and discovery stay off the public
+# fleet.
+[messaging]
