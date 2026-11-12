@@ -35,7 +35,7 @@ logos-agents provide offers.toml
 
 logos-agents `v0.4.0` stops waiting on a job 6 minutes before its escrow deadline, and so does the model. Give the offer's `deliver_within_s` the model's time plus those 6 minutes.
 
-If the backend needs an API key, as oMLX does, set `LOGOS_INFERENCE_API_KEY`. It is sent as a bearer token and never logged.
+If the backend needs an API key, as oMLX or a hosted API may, set `LOGOS_INFERENCE_API_KEY`. It is sent as a bearer token and never logged.
 
 An answer too big for a chat message, about 60 KB or some 15,000 tokens, is delivered through Logos Storage. With a large `--max-tokens`, give `provide` a files root (`LOGOS_MCP_FILES_ROOT`), or such a job is declined and refunded.
 
@@ -74,7 +74,7 @@ A job that arrives twice gets the same answer from one model call. Answers are k
 
 ## Try it on a local devnet
 
-`scripts/demo.py` runs the whole thing on a local LEZ chain from [logos-devnet](https://github.com/drptbl/logos-devnet): a buyer agent finds the offer, gets a quote, pays into escrow and receives the model's answer, twice, and a request over the cap is turned away. It needs a logos-agents `v0.4.0` checkout, for its demo helpers, and its binary:
+`scripts/demo.py` runs the whole thing on a local LEZ chain from [logos-devnet](https://github.com/drptbl/logos-devnet): a buyer agent finds the offer, gets a quote, pays into escrow and receives the model's answer, twice, and a request over the cap is turned away. It needs Python 3.11 or later, a logos-agents `v0.4.0` checkout, for its demo helpers, and its binary:
 
 ```bash
 logos-devnet up
