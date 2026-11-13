@@ -101,20 +101,22 @@ Then use `http://127.0.0.1:8090/v1` as the client's base URL. The gateway starts
 | Option | Meaning |
 | --- | --- |
 | `--model` | a model to serve, bought as `inference/<model>/v1`. Repeat it for more. `/v1/models` lists them |
-| `--max-price-lepta` | the most one completion may pay |
+| `--max-price-lepta` | the most one completion may pay the provider. Each escrow call also costs the network's fee reserve, about 1.7M lepta at a `gas_limit` of 200,000, on top |
 | `--pay-from` | the wallet account that pays, checked when the gateway starts |
 | `--agents-bin`, `--agents-url` | the logos-agents to start, default `logos-agents`, or a running one to use |
-| `--listen` | default `127.0.0.1:8090`. Any other address needs `LOGOS_INFERENCE_GATEWAY_KEY`, which callers then send as a bearer token |
-| `--timeout-s`, `--quote-wait-s` | how long a completion may take, default 600, and how long each provider has to quote, default 60 |
+| `--listen` | default `127.0.0.1:8090`. Any other address needs `LOGOS_INFERENCE_GATEWAY_KEY`, which callers then send as a bearer token. Without a key, the gateway only takes local JSON requests that don't come from a web page, so a page open in your browser can't spend from the wallet |
+| `--timeout-s`, `--quote-wait-s` | how long a completion may take, default 600, and how long each provider has to quote, default 90 |
 
 How a completion is bought:
 
-1. providers of the model are asked one at a time. One that turns the request away, quotes over the cap or doesn't quote in time is skipped
-2. the first quote within the cap is paid. With logos-mcp's approvals on, the gateway waits for yours
+1. providers of the model are asked one at a time. One that turns the request away, quotes over the cap, quotes without escrow or doesn't quote in time is skipped
+2. the first escrow quote within the cap is paid, once. With logos-mcp's approvals on, the gateway waits for yours
 3. the answer comes back as a `chat.completion`. With `stream: true` the gateway sends keep-alives while it waits, then the whole answer as one chunk
-4. if the paid job fails, the call fails and logos-agents refunds the payment. A call never pays twice
+4. if the paid job fails, the call fails and logos-agents refunds the escrow. A call never pays twice
 
-The request is sent as `messages` and `max_tokens` (or `max_completion_tokens`). Sampling hints clients send by default, like `temperature`, `top_p` or `stop`, are dropped. What would change the kind of answer is refused: tools, `n` over 1, `response_format`, logprobs, images and audio. `usage` holds estimated tokens, counted as providers price them. An answer delivered through Logos Storage, over about 60 KB, comes back as an error for now.
+When time runs out after paying, or while a payment's outcome is unclear, the gateway says so and answers with `x-should-retry: false`, so OpenAI's SDKs don't buy the answer a second time. The job goes on in logos-agents, which keeps its answer or refunds the escrow.
+
+The request is sent as `messages` and `max_tokens` (or `max_completion_tokens`). Sampling hints clients send by default, like `temperature`, `top_p` or `stop`, are dropped. What would change the kind of answer is refused: tools, `n` over 1, `response_format`, logprobs, images and audio, and so is any field the gateway doesn't know. `usage` holds estimated tokens, counted as providers price them. An answer delivered through Logos Storage, over about 60 KB, comes back as an error for now.
 
 ## How a job runs
 
