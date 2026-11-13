@@ -2,7 +2,10 @@
 
 Decentralised AI inference over [Logos](https://logos.co/). You run a model, and agents anywhere can find it, pay per job into an escrow on LEZ and get its answers. There is no central server, no accounts and no API keys between buyer and provider.
 
-It builds on [logos-agents](https://github.com/drptbl/logos-agents) `v0.4.0`, unchanged. `logos-agents provide` serves the offer, takes requests and payments and delivers. logos-inference is the handler it calls: it prices each request and runs the paid ones on your model.
+It builds on [logos-agents](https://github.com/drptbl/logos-agents) `v0.4.0`, unchanged. One binary does both sides:
+
+1. `logos-inference serve` => the provider's handler. `logos-agents provide` serves the offer, takes requests and payments and delivers. This prices each request and runs the paid ones on your model
+2. `logos-inference gateway` => the buyer's side. An OpenAI-compatible API on your machine, so any OpenAI client buys its completions over Logos
 
 Early release. Logos is on testnet (`v0.3`) and is not meant for real funds yet.
 
@@ -83,6 +86,36 @@ price = input tokens x input rate + max_tokens x output rate
 
 Input tokens are estimated, not counted by the model's tokenizer: each message's UTF-8 bytes over 4, rounded up, plus 4. The model is asked for at most `max_tokens`, so it never does more than was paid for.
 
+## Buy completions through the gateway
+
+Point any OpenAI client at the gateway, and each chat completion is bought over Logos: from the first provider that quotes within your cap, paid into escrow from your wallet.
+
+```bash
+LOGOS_MCP_PRESET=logos.dev LOGOS_MCP_WALLET_CONFIG=$HOME/buyer/wallet_config.json \
+LOGOS_MCP_WALLET_STORAGE=$HOME/buyer/storage.json LOGOS_MCP_DISCOVERY_BOOTSTRAP=<multiaddr>/p2p/<peer-id> \
+logos-inference gateway --model qwen2.5:0.5b --max-price-lepta 100000 --pay-from Public/<base58>
+```
+
+Then use `http://127.0.0.1:8090/v1` as the client's base URL. The gateway starts its own logos-agents over stdio, with the `LOGOS_MCP_*` settings you give it, so give it a wallet of its own: its balance is the most it can ever spend. To use Basecamp's logos-agents and wallet instead, pass `--agents-url http://127.0.0.1:8766/mcp`.
+
+| Option | Meaning |
+| --- | --- |
+| `--model` | a model to serve, bought as `inference/<model>/v1`. Repeat it for more. `/v1/models` lists them |
+| `--max-price-lepta` | the most one completion may pay |
+| `--pay-from` | the wallet account that pays, checked when the gateway starts |
+| `--agents-bin`, `--agents-url` | the logos-agents to start, default `logos-agents`, or a running one to use |
+| `--listen` | default `127.0.0.1:8090`. Any other address needs `LOGOS_INFERENCE_GATEWAY_KEY`, which callers then send as a bearer token |
+| `--timeout-s`, `--quote-wait-s` | how long a completion may take, default 600, and how long each provider has to quote, default 60 |
+
+How a completion is bought:
+
+1. providers of the model are asked one at a time. One that turns the request away, quotes over the cap or doesn't quote in time is skipped
+2. the first quote within the cap is paid. With logos-mcp's approvals on, the gateway waits for yours
+3. the answer comes back as a `chat.completion`. With `stream: true` the gateway sends keep-alives while it waits, then the whole answer as one chunk
+4. if the paid job fails, the call fails and logos-agents refunds the payment. A call never pays twice
+
+The request is sent as `messages` and `max_tokens` (or `max_completion_tokens`). Sampling hints clients send by default, like `temperature`, `top_p` or `stop`, are dropped. What would change the kind of answer is refused: tools, `n` over 1, `response_format`, logprobs, images and audio. `usage` holds estimated tokens, counted as providers price them. An answer delivered through Logos Storage, over about 60 KB, comes back as an error for now.
+
 ## How a job runs
 
 1. `/quote` gets the request and answers its price, or a reason to turn it away
@@ -95,7 +128,7 @@ A job that arrives twice gets the same answer from one model call. Answers are k
 
 ## Try it on a local devnet
 
-`scripts/demo.py` runs the whole thing on a local LEZ chain from [logos-devnet](https://github.com/drptbl/logos-devnet): a buyer agent finds the offer, gets a quote, pays into escrow and receives the model's answer, twice, and a request over the cap is turned away. It needs Python 3.11 or later, a logos-agents `v0.4.0` checkout, for its demo helpers, and its binary:
+`scripts/demo.py` runs the whole thing on a local LEZ chain from [logos-devnet](https://github.com/drptbl/logos-devnet): a buyer agent finds the offer, gets a quote, pays into escrow and receives the model's answer, twice, and a request over the cap is turned away. Then an OpenAI client buys two completions, one streamed, through the gateway. It needs Python 3.11 or later, a logos-agents `v0.4.0` checkout, for its demo helpers, and its binary:
 
 ```bash
 logos-devnet up
