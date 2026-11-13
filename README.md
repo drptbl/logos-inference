@@ -123,7 +123,7 @@ When time runs out after paying, or while a payment's outcome is unclear, the ga
 
 The request is sent as `messages` and `max_tokens` (or `max_completion_tokens`). Sampling hints clients send by default, like `temperature`, `top_p` or `stop`, are dropped. What would change the kind of answer is refused: tools, `n` over 1, `response_format`, logprobs, images and audio, and so is any field the gateway doesn't know. `usage` holds estimated tokens, counted as providers price them.
 
-A prompt too big for a chat message, over about 64 KB, is put in Logos Storage and sent as its CID, and an answer delivered that way is fetched back. Both need `--files-root`. A provider quotes a CID prompt at its `--max-input-tokens` ceiling, so raise `--max-price-lepta` to match. On Linux, a client that stops reading a stream is let go after 30 seconds. On macOS it holds its place under `--max-calls` until it disconnects.
+A prompt too big for a chat message, over about 64 KB, is put in Logos Storage and sent as its CID, and an answer delivered that way is fetched back. Both need `--files-root`. A provider quotes a CID prompt at its `--max-input-tokens` ceiling, so raise `--max-price-lepta` to match. Content in Logos Storage can be read by anyone who has its CID: a long prompt travels that way, unlike a short one, which goes end-to-end encrypted in the chat message. On Linux, a client that stops reading a stream is let go after 30 seconds. On macOS it holds its place under `--max-calls` until it disconnects.
 
 ## How a job runs
 
