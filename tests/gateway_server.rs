@@ -205,6 +205,23 @@ fn raw(url: &str, version: &str, headers: &[(&str, &str)], body: &Value) -> (Str
     (head, rest)
 }
 
+/// The start of the answer to a completion request: its status line's first twelve bytes.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn status_line(url: &str, body: &Value) -> String {
+    let addr = url.trim_start_matches("http://");
+    let mut socket = TcpStream::connect(addr).unwrap();
+    let body = body.to_string();
+    write!(
+        socket,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut start = [0; 12];
+    socket.read_exact(&mut start).unwrap();
+    String::from_utf8_lossy(&start).into_owned()
+}
+
 /// A streamed completion read to the end: the head, and the stream's lines.
 fn raw_stream(url: &str, body: &Value) -> (String, Vec<String>) {
     let (head, rest) = raw(url, "HTTP/1.1", &[], body);
@@ -524,15 +541,8 @@ fn lets_go_of_a_client_that_stops_reading() {
     // The stuck stream frees its slot once a write times out.
     let started = std::time::Instant::now();
     loop {
-        let mut next = chat(false);
-        next["messages"][0]["content"] = json!("Hi");
-        let (status, _) = call(
-            "POST",
-            &format!("{url}/v1/chat/completions"),
-            Some(&next),
-            None,
-        );
-        if status != 429 {
+        // Only the status matters: the answer would be the same 64 MiB.
+        if status_line(&url, &chat(false)) != "HTTP/1.1 429" {
             break;
         }
         assert!(
