@@ -22,3 +22,6 @@ modules = ["chat_module", "libp2p_module"]
 # A local delivery node and discovery bootstrap, so chat and discovery stay off the public
 # fleet.
 [messaging]
+
+# A local storage node the sessions share, for prompts and answers too big for a chat message.
+[storage]

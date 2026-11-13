@@ -85,7 +85,7 @@ jobs:
             echo "$MODEL_SHA256  $gguf" | sha256sum -c
           fi
           docker run -d --name llama-server -p 127.0.0.1:8081:8080 -v "$RUNNER_TEMP/model:/models:ro" \
-            "$LLAMA_SERVER" -m /models/model.gguf --alias "$MODEL" --host 0.0.0.0 --port 8080 -c 2048
+            "$LLAMA_SERVER" -m /models/model.gguf --alias "$MODEL" --host 0.0.0.0 --port 8080 -c 32768
           for _ in $(seq 120); do
             if curl -fs http://127.0.0.1:8081/health >/dev/null; then
               exit 0
