@@ -53,7 +53,7 @@ Download the binary for your platform from the [latest release](https://github.c
 Check it against its `.sha256` before you run it. On macOS:
 
 ```bash
-v=v0.3.0 target=aarch64-apple-darwin
+v=v0.3.1 target=aarch64-apple-darwin
 curl -LO https://github.com/drptbl/logos-inference/releases/download/$v/logos-inference-$v-$target.tar.gz
 curl -LO https://github.com/drptbl/logos-inference/releases/download/$v/logos-inference-$v-$target.tar.gz.sha256
 shasum -a 256 -c logos-inference-$v-$target.tar.gz.sha256
