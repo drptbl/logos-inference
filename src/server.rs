@@ -5,7 +5,7 @@ use crate::job::{Pricing, Prompt, Refusal, parse};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, Read};
+use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -48,8 +48,6 @@ pub struct Config {
     pub timeout: Duration,
 }
 
-/// The largest request body read. logos-agents caps an input at 8 MiB.
-const MAX_BODY: u64 = 16 << 20;
 /// How long before a job's deadline logos-agents v0.4.0 stops waiting on a handler: its
 /// deadline margin (5 minutes) and the time a delivery needs to land (1 minute). An answer
 /// after that can't be delivered, so the model isn't kept at it.
@@ -163,15 +161,8 @@ fn handle(state: &State, mut request: tiny_http::Request) {
 }
 
 fn read(request: &mut tiny_http::Request) -> Result<Ask, Answer> {
-    let mut body = Vec::new();
-    request
-        .as_reader()
-        .take(MAX_BODY + 1)
-        .read_to_end(&mut body)
-        .map_err(|_| Answer::reason(400, "the request couldn't be read"))?;
-    if body.len() as u64 > MAX_BODY {
-        return Err(Answer::reason(413, "the request is too big"));
-    }
+    let body = crate::http::read_body(request)
+        .map_err(|(status, reason)| Answer::reason(status, reason))?;
     let ask: Ask =
         serde_json::from_slice(&body).map_err(|_| Answer::reason(400, "not a job request"))?;
     // logos-agents' job ids are 32 hex characters; this bounds what is kept and logged.
