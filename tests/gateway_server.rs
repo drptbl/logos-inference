@@ -553,3 +553,50 @@ fn lets_go_of_a_client_that_stops_reading() {
     }
     drop(stuck);
 }
+
+#[test]
+fn answers_more_requests_at_once_than_it_has_workers() {
+    // One completion slot, and a few workers beside it: a slow completion holds one of them.
+    let url = start_config(
+        fake(&[("a", Script::Late(10, "slow", Duration::from_millis(800)))]),
+        GatewayConfig {
+            max_calls: 1,
+            ..config()
+        },
+    );
+    let slow = {
+        let url = url.clone();
+        thread::spawn(move || {
+            call(
+                "POST",
+                &format!("{url}/v1/chat/completions"),
+                Some(&chat(false)),
+                None,
+            )
+        })
+    };
+    thread::sleep(Duration::from_millis(100));
+    let others: Vec<_> = (0..20)
+        .map(|i| {
+            let url = url.clone();
+            thread::spawn(move || {
+                if i % 2 == 0 {
+                    call("GET", &format!("{url}/v1/models"), None, None).0
+                } else {
+                    call(
+                        "POST",
+                        &format!("{url}/v1/chat/completions"),
+                        Some(&chat(false)),
+                        None,
+                    )
+                    .0
+                }
+            })
+        })
+        .collect();
+    for (i, other) in others.into_iter().enumerate() {
+        let expected = if i % 2 == 0 { 200 } else { 429 };
+        assert_eq!(other.join().unwrap(), expected, "request {i}");
+    }
+    assert_eq!(slow.join().unwrap().0, 200);
+}

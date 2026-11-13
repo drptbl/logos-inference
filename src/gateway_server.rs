@@ -28,6 +28,9 @@ pub struct GatewayConfig {
     pub send_timeout: Duration,
 }
 
+/// Workers beyond `max_calls`, for requests that aren't completions being bought.
+const SPARE_WORKERS: usize = 4;
+
 pub struct GatewayServer<A: Agent> {
     http: tiny_http::Server,
     state: Arc<State<A>>,
@@ -81,11 +84,27 @@ impl<A: Agent + 'static> GatewayServer<A> {
             .expect("listening on an IP address")
     }
 
-    /// Serves until the process ends, each request on its own thread.
+    /// Serves until the process ends, on `max_calls` workers and a few spare. A completion
+    /// holds a worker while it's bought, and the spare ones answer the rest, `/v1/models` and
+    /// the 429s among it. More requests wait for a worker rather than each getting a thread.
     pub fn run(self) {
-        for request in self.http.incoming_requests() {
-            let state = self.state.clone();
-            thread::spawn(move || state.handle(request));
+        let workers = self.state.config.max_calls + SPARE_WORKERS;
+        let http = Arc::new(self.http);
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                let (http, state) = (http.clone(), self.state.clone());
+                thread::spawn(move || {
+                    while let Ok(request) = http.recv() {
+                        // A request that panics ends, not the worker.
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            state.handle(request)
+                        }));
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            let _ = handle.join();
         }
     }
 }

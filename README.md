@@ -110,7 +110,7 @@ Then use `http://127.0.0.1:8090/v1` as the client's base URL. The gateway starts
 | `--listen` | default `127.0.0.1:8090`. Any other address needs `LOGOS_INFERENCE_GATEWAY_KEY`, which callers then send as a bearer token. Without a key, the gateway only takes local JSON requests that don't come from a web page, so a page open in your browser can't spend from the wallet |
 | `--timeout-s`, `--quote-wait-s` | how long a completion may take, default 600, and how long each provider has to quote, default 90 |
 | `--files-root` | logos-agents' files root, for prompts and answers too big for a chat message. Default `LOGOS_MCP_FILES_ROOT`. A logos-agents the gateway starts gets it as its own |
-| `--max-calls` | the most completions bought at once, default 16. More are answered 429 until one finishes |
+| `--max-calls` | the most completions bought at once, default 16. More are answered 429 until one finishes. The gateway serves on that many workers and 4 more, and further requests wait for one |
 
 How a completion is bought:
 
