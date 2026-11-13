@@ -1,15 +1,77 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
+use logos_inference::agent::Agent;
+use logos_inference::gateway::Gateway;
+use logos_inference::gateway_server::{GatewayConfig, GatewayServer};
 use logos_inference::job::Pricing;
+use logos_inference::mcp_agent::McpAgent;
 use logos_inference::server::{Backend, Config, Server, TokenField};
 use std::process::ExitCode;
 use std::time::Duration;
 
-/// Serves a model to logos-agents' `provide`: `/quote` prices a request by its estimated
-/// tokens, `/run` answers a paid job with the model's output. The backend's API key, if it
-/// needs one, comes from LOGOS_INFERENCE_API_KEY.
+/// Decentralised AI inference over Logos, on logos-agents.
 #[derive(Parser)]
 #[command(version)]
-struct Args {
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    Serve(ServeArgs),
+    Gateway(GatewayArgs),
+}
+
+/// Serve OpenAI's chat completions to local clients, each bought over Logos, as a buyer.
+///
+/// Each completion for a --model is bought as a job of `inference/<model>/v1`: from the first
+/// provider that quotes within --max-price-lepta, paid into escrow from --pay-from. A key for
+/// callers, needed to listen beyond this machine, comes from LOGOS_INFERENCE_GATEWAY_KEY.
+#[derive(clap::Args)]
+struct GatewayArgs {
+    /// A model to serve, as providers name it in their service id. Repeat for more.
+    #[arg(long = "model", required = true)]
+    models: Vec<String>,
+    /// The most one completion may pay, in lepta.
+    #[arg(long, value_parser = parse_price)]
+    max_price_lepta: u128,
+    /// The wallet account every payment comes from, Public/<base58>.
+    #[arg(long)]
+    pay_from: String,
+    /// The logos-agents binary to start, over stdio. It takes this process's environment, so
+    /// LOGOS_MCP_* choose its wallet and network.
+    #[arg(long, default_value = "logos-agents", conflicts_with = "agents_url")]
+    agents_bin: String,
+    /// A running logos-agents MCP endpoint to use instead, e.g. Basecamp's
+    /// http://127.0.0.1:8766/mcp.
+    #[arg(long)]
+    agents_url: Option<String>,
+    /// Where to listen.
+    #[arg(long, default_value = "127.0.0.1:8090")]
+    listen: String,
+    /// The longest one completion may take, in seconds.
+    #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..))]
+    timeout_s: u64,
+    /// How long a provider has to quote before the next one is asked, in seconds. logos-agents
+    /// asks a provider again after a minute without an answer, so the default leaves room.
+    #[arg(long, default_value_t = 90, value_parser = clap::value_parser!(u64).range(1..))]
+    quote_wait_s: u64,
+}
+
+fn parse_price(text: &str) -> Result<u128, String> {
+    match text.parse::<u128>() {
+        Ok(0) | Err(_) => Err("a whole number of lepta above 0".into()),
+        Ok(price) => Ok(price),
+    }
+}
+
+/// Serve a model to logos-agents' `provide`, as a provider.
+///
+/// `/quote` prices a request by its estimated tokens, `/run` answers a paid job with the
+/// model's output. The backend's API key, if it needs one, comes from
+/// LOGOS_INFERENCE_API_KEY.
+#[derive(clap::Args)]
+struct ServeArgs {
     /// The OpenAI-compatible API's base URL, e.g. http://127.0.0.1:11434/v1 for Ollama.
     #[arg(long)]
     backend: String,
@@ -43,7 +105,67 @@ struct Args {
 }
 
 fn main() -> ExitCode {
-    let args = Args::parse();
+    match Cli::parse().command {
+        Command::Serve(args) => serve(args),
+        Command::Gateway(args) => gateway(args),
+    }
+}
+
+fn gateway(args: GatewayArgs) -> ExitCode {
+    let agent = match &args.agents_url {
+        Some(url) => McpAgent::connect(url),
+        None => McpAgent::spawn(&args.agents_bin),
+    };
+    let agent = match agent {
+        Ok(agent) => agent,
+        Err(e) => {
+            eprintln!("logos-inference: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = agent.check_payer(&args.pay_from) {
+        eprintln!("logos-inference: --pay-from: {e}");
+        return ExitCode::FAILURE;
+    }
+    let config = GatewayConfig {
+        models: args.models,
+        key: std::env::var("LOGOS_INFERENCE_GATEWAY_KEY")
+            .ok()
+            .filter(|k| !k.is_empty()),
+        timeout: Duration::from_secs(args.timeout_s),
+        keep_alive: Duration::from_secs(10),
+    };
+    let gateway = Gateway {
+        agent,
+        pay_from: args.pay_from,
+        max_price_lepta: args.max_price_lepta,
+        quote_wait: Duration::from_secs(args.quote_wait_s),
+        poll: Duration::from_secs(1),
+    };
+    run_gateway(&args.listen, gateway, config)
+}
+
+fn run_gateway<A: Agent + 'static>(
+    listen: &str,
+    gateway: Gateway<A>,
+    config: GatewayConfig,
+) -> ExitCode {
+    let server = match GatewayServer::bind(listen, gateway, config) {
+        Ok(server) => server,
+        Err(e) => {
+            eprintln!("logos-inference: can't listen on {listen}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!(
+        "logos-inference: serving /v1/chat/completions on http://{}",
+        server.addr()
+    );
+    server.run();
+    ExitCode::SUCCESS
+}
+
+fn serve(args: ServeArgs) -> ExitCode {
     if args.input_lepta_per_token == 0 && args.output_lepta_per_token == 0 {
         eprintln!("logos-inference: a job has to cost something: set a rate above 0");
         return ExitCode::FAILURE;

@@ -33,12 +33,17 @@ pub struct Prompt {
 /// Tokens counted for each message's role and framing.
 const PER_MESSAGE: u64 = 4;
 
+/// A text's tokens, estimated as its UTF-8 byte count over 4, rounded up.
+pub fn estimate_tokens(text: &str) -> u64 {
+    (text.len() as u64).div_ceil(4)
+}
+
 impl Prompt {
-    /// The input's tokens, estimated as a UTF-8 byte count over 4, rounded up, per message.
+    /// The input's tokens, estimated per message as its text's tokens plus its framing.
     pub fn input_tokens(&self) -> u64 {
         self.messages
             .iter()
-            .map(|m| (m.content.len() as u64).div_ceil(4) + PER_MESSAGE)
+            .map(|m| estimate_tokens(&m.content) + PER_MESSAGE)
             .sum()
     }
 
