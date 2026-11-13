@@ -152,7 +152,8 @@ fn gateway(args: GatewayArgs) -> ExitCode {
         keep_alive: Duration::from_secs(10),
         max_calls: args.max_calls as usize,
         send_timeout: Duration::from_secs(30),
-        read_timeout: Duration::from_secs(30),
+        // A minute past the longest a completion may take.
+        read_timeout: Duration::from_secs(args.timeout_s + 60),
     };
     let gateway = Gateway {
         agent,

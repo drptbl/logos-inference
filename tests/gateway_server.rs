@@ -34,7 +34,7 @@ fn config() -> GatewayConfig {
         keep_alive: Duration::from_secs(10),
         max_calls: 16,
         send_timeout: Duration::from_secs(30),
-        read_timeout: Duration::from_secs(30),
+        read_timeout: Duration::from_secs(60),
     }
 }
 
@@ -575,7 +575,8 @@ fn lets_go_of_a_request_whose_body_stalls() {
     let url = start_config(
         fake(&[]),
         GatewayConfig {
-            read_timeout: Duration::from_millis(300),
+            timeout: Duration::from_millis(200),
+            read_timeout: Duration::from_millis(400),
             ..config()
         },
     );
@@ -587,4 +588,20 @@ fn lets_go_of_a_request_whose_body_stalls() {
     let mut start = [0; 12];
     stalled.read_exact(&mut start).unwrap();
     assert_eq!(&start, b"HTTP/1.1 400");
+}
+
+#[test]
+fn will_not_cut_off_a_completion_with_its_read_timeout() {
+    let short = GatewayConfig {
+        timeout: Duration::from_secs(600),
+        read_timeout: Duration::from_secs(30),
+        ..config()
+    };
+    let refused = GatewayServer::bind("127.0.0.1:0", gateway(fake(&[])), short)
+        .err()
+        .unwrap();
+    assert_eq!(
+        refused.to_string(),
+        "the read timeout has to outlast a completion, or a slow one is cut off"
+    );
 }

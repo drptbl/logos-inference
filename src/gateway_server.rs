@@ -26,7 +26,9 @@ pub struct GatewayConfig {
     pub max_calls: usize,
     /// How long a write to a client may block, so one that stops reading lets go.
     pub send_timeout: Duration,
-    /// How long a read from a client may block, so one whose request stalls lets go.
+    /// How long a read from a client may block, so one whose request stalls lets go. It
+    /// must outlast `timeout`: tiny_http also reads a connection while its request is being
+    /// answered, and a read that times out closes it.
     pub read_timeout: Duration,
 }
 
@@ -63,6 +65,11 @@ impl<A: Agent + 'static> GatewayServer<A> {
     /// Listens on `addr`. Every completion spends from the wallet, so an address beyond this
     /// machine needs a key.
     pub fn bind(addr: &str, gateway: Gateway<A>, config: GatewayConfig) -> io::Result<Self> {
+        if config.read_timeout <= config.timeout {
+            return Err(io::Error::other(
+                "the read timeout has to outlast a completion, or a slow one is cut off",
+            ));
+        }
         let listener = std::net::TcpListener::bind(addr)?;
         // Linux gives each connection the listener's timeouts. macOS doesn't, so there a client
         // that stops reading, or stalls its request, holds its place until it goes away.
