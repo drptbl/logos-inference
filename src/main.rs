@@ -1,15 +1,29 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use logos_inference::job::Pricing;
 use logos_inference::server::{Backend, Config, Server, TokenField};
 use std::process::ExitCode;
 use std::time::Duration;
 
-/// Serves a model to logos-agents' `provide`: `/quote` prices a request by its estimated
-/// tokens, `/run` answers a paid job with the model's output. The backend's API key, if it
-/// needs one, comes from LOGOS_INFERENCE_API_KEY.
+/// Decentralised AI inference over Logos, on logos-agents.
 #[derive(Parser)]
 #[command(version)]
-struct Args {
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    Serve(ServeArgs),
+}
+
+/// Serve a model to logos-agents' `provide`, as a provider.
+///
+/// `/quote` prices a request by its estimated tokens, `/run` answers a paid job with the
+/// model's output. The backend's API key, if it needs one, comes from
+/// LOGOS_INFERENCE_API_KEY.
+#[derive(clap::Args)]
+struct ServeArgs {
     /// The OpenAI-compatible API's base URL, e.g. http://127.0.0.1:11434/v1 for Ollama.
     #[arg(long)]
     backend: String,
@@ -43,7 +57,12 @@ struct Args {
 }
 
 fn main() -> ExitCode {
-    let args = Args::parse();
+    match Cli::parse().command {
+        Command::Serve(args) => serve(args),
+    }
+}
+
+fn serve(args: ServeArgs) -> ExitCode {
     if args.input_lepta_per_token == 0 && args.output_lepta_per_token == 0 {
         eprintln!("logos-inference: a job has to cost something: set a rate above 0");
         return ExitCode::FAILURE;

@@ -58,7 +58,7 @@ def serve_model(args, logs):
     """Starts logos-inference on a free port and returns its URL."""
     log = os.path.join(logs, "inference.log")
     server = subprocess.Popen(
-        [args.bin, "--backend", args.backend, "--model", args.model,
+        [args.bin, "serve", "--backend", args.backend, "--model", args.model,
          "--input-lepta-per-token", str(INPUT_RATE), "--output-lepta-per-token", str(OUTPUT_RATE),
          "--max-tokens", str(MAX_TOKENS), "--listen", "127.0.0.1:0"],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=open(log, "w"))

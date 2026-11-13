@@ -11,7 +11,7 @@ Early release. Logos is on testnet (`v0.3`) and is not meant for real funds yet.
 You need a model behind an OpenAI-compatible chat completions API (Ollama, llama.cpp's `llama-server`, oMLX, vLLM, LM Studio or a hosted one), logos-agents `v0.4.0` ([install](https://github.com/drptbl/logos-agents#install)) and its [requirements](https://github.com/drptbl/logos-agents#requirements). With logos-inference [installed](#install):
 
 ```bash
-logos-inference --backend http://127.0.0.1:11434/v1 --model qwen2.5:0.5b \
+logos-inference serve --backend http://127.0.0.1:11434/v1 --model qwen2.5:0.5b \
   --input-lepta-per-token 10 --output-lepta-per-token 100 --max-tokens 512
 ```
 
