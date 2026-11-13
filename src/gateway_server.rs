@@ -26,6 +26,10 @@ pub struct GatewayConfig {
     pub max_calls: usize,
     /// How long a write to a client may block, so one that stops reading lets go.
     pub send_timeout: Duration,
+    /// How long a read from a client may block, so one whose request stalls lets go. It
+    /// must outlast `timeout`: tiny_http also reads a connection while its request is being
+    /// answered, and a read that times out closes it.
+    pub read_timeout: Duration,
 }
 
 pub struct GatewayServer<A: Agent> {
@@ -37,13 +41,21 @@ struct State<A: Agent> {
     gateway: Gateway<A>,
     config: GatewayConfig,
     /// Completions being bought now.
-    calls: AtomicUsize,
+    calls: Arc<AtomicUsize>,
 }
 
-/// One completion's place under `max_calls`, given back when it ends.
-struct Slot<'a>(&'a AtomicUsize);
+/// One place under a limit, given back when it's dropped.
+struct Slot(Arc<AtomicUsize>);
 
-impl Drop for Slot<'_> {
+impl Slot {
+    fn take(count: &Arc<AtomicUsize>, most: usize) -> Option<Slot> {
+        let taken = count.fetch_add(1, Ordering::Relaxed);
+        let slot = Slot(count.clone());
+        (taken < most).then_some(slot)
+    }
+}
+
+impl Drop for Slot {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
     }
@@ -53,10 +65,17 @@ impl<A: Agent + 'static> GatewayServer<A> {
     /// Listens on `addr`. Every completion spends from the wallet, so an address beyond this
     /// machine needs a key.
     pub fn bind(addr: &str, gateway: Gateway<A>, config: GatewayConfig) -> io::Result<Self> {
+        if config.read_timeout <= config.timeout {
+            return Err(io::Error::other(
+                "the read timeout has to outlast a completion, or a slow one is cut off",
+            ));
+        }
         let listener = std::net::TcpListener::bind(addr)?;
-        // Linux gives each connection the listener's send timeout. macOS doesn't, so there a
-        // client that stops reading holds its slot until it goes away.
-        socket2::SockRef::from(&listener).set_write_timeout(Some(config.send_timeout))?;
+        // Linux gives each connection the listener's timeouts. macOS doesn't, so there a client
+        // that stops reading, or stalls its request, holds its place until it goes away.
+        let socket = socket2::SockRef::from(&listener);
+        socket.set_write_timeout(Some(config.send_timeout))?;
+        socket.set_read_timeout(Some(config.read_timeout))?;
         let http = tiny_http::Server::from_listener(listener, None).map_err(io::Error::other)?;
         let ip = http.server_addr().to_ip().map(|a| a.ip());
         if config.key.is_none() && !ip.is_some_and(|ip| ip.is_loopback()) {
@@ -69,7 +88,7 @@ impl<A: Agent + 'static> GatewayServer<A> {
             state: Arc::new(State {
                 gateway,
                 config,
-                calls: AtomicUsize::new(0),
+                calls: Arc::default(),
             }),
         })
     }
@@ -81,7 +100,9 @@ impl<A: Agent + 'static> GatewayServer<A> {
             .expect("listening on an IP address")
     }
 
-    /// Serves until the process ends, each request on its own thread.
+    /// Serves until the process ends, each request on its own thread. tiny_http reads a
+    /// request's unread body before letting it go, so a request can't be turned away without
+    /// a thread either: the read timeout is what lets go of one whose body stalls.
     pub fn run(self) {
         for request in self.http.incoming_requests() {
             let state = self.state.clone();
@@ -144,10 +165,8 @@ impl<A: Agent> State<A> {
         }
     }
 
-    fn slot(&self) -> Option<Slot<'_>> {
-        let taken = self.calls.fetch_add(1, Ordering::Relaxed);
-        let slot = Slot(&self.calls);
-        (taken < self.config.max_calls).then_some(slot)
+    fn slot(&self) -> Option<Slot> {
+        Slot::take(&self.calls, self.config.max_calls)
     }
 
     /// Lets a request in. With a key, only callers that send it. Without one, only local

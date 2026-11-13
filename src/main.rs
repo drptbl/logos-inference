@@ -58,7 +58,7 @@ struct GatewayArgs {
     #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..))]
     timeout_s: u64,
     /// The most completions bought at once. More are answered 429 until one finishes.
-    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u64).range(1..=1024))]
     max_calls: u64,
     /// How long a provider has to quote before the next one is asked, in seconds. logos-agents
     /// asks a provider again after a minute without an answer, so the default leaves room.
@@ -152,6 +152,8 @@ fn gateway(args: GatewayArgs) -> ExitCode {
         keep_alive: Duration::from_secs(10),
         max_calls: args.max_calls as usize,
         send_timeout: Duration::from_secs(30),
+        // A minute past the longest a completion may take.
+        read_timeout: Duration::from_secs(args.timeout_s + 60),
     };
     let gateway = Gateway {
         agent,

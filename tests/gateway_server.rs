@@ -34,6 +34,7 @@ fn config() -> GatewayConfig {
         keep_alive: Duration::from_secs(10),
         max_calls: 16,
         send_timeout: Duration::from_secs(30),
+        read_timeout: Duration::from_secs(60),
     }
 }
 
@@ -552,4 +553,55 @@ fn lets_go_of_a_client_that_stops_reading() {
         thread::sleep(Duration::from_millis(200));
     }
     drop(stuck);
+}
+
+/// Opens a completion request whose body never comes, and leaves it open.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn stall(url: &str) -> TcpStream {
+    let addr = url.trim_start_matches("http://");
+    let mut socket = TcpStream::connect(addr).unwrap();
+    write!(
+        socket,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: 2000\r\n\r\n{{\"model\":"
+    )
+    .unwrap();
+    socket
+}
+
+// Linux gives each connection the listener's read timeout; macOS doesn't.
+#[cfg(target_os = "linux")]
+#[test]
+fn lets_go_of_a_request_whose_body_stalls() {
+    let url = start_config(
+        fake(&[]),
+        GatewayConfig {
+            timeout: Duration::from_millis(200),
+            read_timeout: Duration::from_millis(400),
+            ..config()
+        },
+    );
+    // The body never comes: the read times out, and the request is answered and let go.
+    let mut stalled = stall(&url);
+    stalled
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut start = [0; 12];
+    stalled.read_exact(&mut start).unwrap();
+    assert_eq!(&start, b"HTTP/1.1 400");
+}
+
+#[test]
+fn will_not_cut_off_a_completion_with_its_read_timeout() {
+    let short = GatewayConfig {
+        timeout: Duration::from_secs(600),
+        read_timeout: Duration::from_secs(30),
+        ..config()
+    };
+    let refused = GatewayServer::bind("127.0.0.1:0", gateway(fake(&[])), short)
+        .err()
+        .unwrap();
+    assert_eq!(
+        refused.to_string(),
+        "the read timeout has to outlast a completion, or a slow one is cut off"
+    );
 }

@@ -11,8 +11,10 @@ buyer agent finds the offer and asks for three jobs:
 3. a chat request over the offer's output cap, turned away before anyone pays
 
 Then the buyer's wallet goes behind `logos-inference gateway`, and an OpenAI client buys
-three completions through it: one streamed, and one with a prompt too big for a chat
-message, which goes through Logos Storage and is quoted at the offer's input ceiling.
+four completions through it: one streamed, one with a prompt too big for a chat message,
+which goes through Logos Storage and is quoted at the offer's input ceiling, and one whose
+answer is too big for a chat message, which comes back through Logos Storage. A small proxy
+in front of the backend writes that answer, since a small model won't.
 
 Run `logos-devnet up` in this repo first, with logos-devnet and logosctl on PATH, a
 logos-agents v0.4.0 checkout (for its demo helpers) and its binary, and the model
@@ -27,8 +29,10 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
 import tomllib
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -40,6 +44,41 @@ MAX_TOKENS = 32
 MAX_INPUT_TOKENS = 24_000
 # A prompt over a chat message's 64 KB, so the gateway sends it through Logos Storage.
 BIG_PROMPT = "Answer with one word, the word this text repeats: " + "logos " * 11_000
+# A prompt the proxy answers itself, with an answer over a chat message's 64 KB.
+LONG_ASK = "Write a long answer."
+LONG_ANSWER = "logos " * 12_000
+
+
+def proxy_backend(backend):
+    """An OpenAI-compatible backend in front of `backend`: it answers LONG_ASK with
+    LONG_ANSWER itself and passes every other request on. Returns its base URL."""
+    class Proxy(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            if json.loads(body)["messages"][-1]["content"] == LONG_ASK:
+                status = 200
+                reply = json.dumps({"choices": [{"index": 0, "finish_reason": "stop",
+                                                 "message": {"role": "assistant", "content": LONG_ANSWER}}]}).encode()
+            else:
+                ask = urllib.request.Request(backend.rstrip("/") + self.path[len("/v1"):], data=body,
+                                             headers={"Content-Type": "application/json"})
+                try:
+                    with urllib.request.urlopen(ask, timeout=900) as r:
+                        status, reply = r.status, r.read()
+                except urllib.error.HTTPError as e:
+                    status, reply = e.code, e.read()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(reply)))
+            self.end_headers()
+            self.wfile.write(reply)
+
+        def log_message(self, *_):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{server.server_port}/v1"
 
 PROMPT = "In one sentence, what is an escrow?"
 CHAT = {"messages": [{"role": "system", "content": "Answer in at most five words."},
@@ -63,10 +102,10 @@ def write_offers(source, path, service, base):
         f.write("[[offer]]\n" + "".join(f"{key} = {json.dumps(value, ensure_ascii=False)}\n" for key, value in offer.items()))
 
 
-def serve_model(args, logs):
+def serve_model(args, logs, backend):
     """Starts logos-inference serve on a free port and returns it with its URL."""
     return start_listening(
-        [args.bin, "serve", "--backend", args.backend, "--model", args.model,
+        [args.bin, "serve", "--backend", backend, "--model", args.model,
          "--input-lepta-per-token", str(INPUT_RATE), "--output-lepta-per-token", str(OUTPUT_RATE),
          "--max-tokens", str(MAX_TOKENS), "--max-input-tokens", str(MAX_INPUT_TOKENS),
          "--listen", "127.0.0.1:0"],
@@ -125,7 +164,7 @@ def main():
     demo.on_devnet(sides)
 
     logs = tempfile.mkdtemp(prefix="logos-inference-demo-")
-    inference, base = serve_model(args, logs)
+    inference, base = serve_model(args, logs, proxy_backend(args.backend))
     demo.log(f"[provider] logos-inference serving {args.model} from {args.backend} on {base}")
     offers = os.path.join(logs, "offers.toml")
     write_offers(args.offers, offers, service, base)
@@ -226,11 +265,15 @@ def main():
                 sys.exit(f"the gateway's answer was empty: {body}")
             how = "streamed" if stream else "answered"
             size = f" for a {len(prompt) // 1000} KB prompt" if len(prompt) > 1000 else ""
-            demo.log(f"[buyer] an OpenAI client was {how} {text!r}{size} in {time.time() - started:.0f}s")
+            shown = f"{len(text) // 1000} KB" if len(text) > 1000 else repr(text)
+            demo.log(f"[buyer] an OpenAI client was {how} {shown}{size} in {time.time() - started:.0f}s")
+            return text
 
         completion(stream=False)
         completion(stream=True)
         completion(stream=False, prompt=BIG_PROMPT)
+        if completion(stream=False, prompt=LONG_ASK) != LONG_ANSWER:
+            sys.exit("the answer that came through storage isn't the one written")
     finally:
         if gateway:
             gateway.terminate()
