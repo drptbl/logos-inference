@@ -221,6 +221,9 @@ pub fn payment(answer: Result<Value, ToolError>) -> Result<Payment, String> {
         "has just landed",
         "provider wasn't told",
         "another call is working",
+        // While finishing a recorded payment, or with the job already past its quote.
+        "can't read the job's escrow",
+        "not waiting for payment",
     ];
     match answer {
         Ok(paid) => match paid["status"].as_str() {

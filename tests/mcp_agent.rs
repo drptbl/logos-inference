@@ -136,6 +136,8 @@ fn counts_a_refusal_as_nothing_sent_only_when_logos_agents_says_so() {
         "the escrow open ab12 hasn't landed yet: call service_pay again in a few minutes",
         "paid, but the provider wasn't told: chat down. Call service_pay again to tell it; nothing more will be paid",
         "another call is working on job j1: try again shortly",
+        "can't read the job's escrow: rpc down",
+        "job j1 is paid, not waiting for payment",
     ] {
         assert_eq!(
             payment(Err(ToolError::Refused(maybe_sent.into()))),

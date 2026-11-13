@@ -142,10 +142,14 @@ fn raw(url: &str, version: &str, headers: &[(&str, &str)], body: &Value) -> (Str
     let mut socket = TcpStream::connect(addr).unwrap();
     let body = body.to_string();
     let mut head = format!(
-        "POST /v1/chat/completions {version}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        "POST /v1/chat/completions {version}\r\nContent-Length: {}\r\n",
         body.len()
     );
-    let mut sent = vec![("Host", addr), ("Content-Type", "application/json")];
+    let mut sent = vec![
+        ("Host", addr),
+        ("Content-Type", "application/json"),
+        ("Connection", "close"),
+    ];
     for (name, value) in headers {
         sent.retain(|(n, _)| n != name);
         sent.push((name, value));
@@ -164,8 +168,23 @@ fn raw(url: &str, version: &str, headers: &[(&str, &str)], body: &Value) -> (Str
         }
         head.push_str(&line);
     }
+    // A body with a length is read to it: the connection may stay open after it.
+    let length = head.lines().find_map(|l| {
+        l.to_ascii_lowercase()
+            .strip_prefix("content-length:")
+            .map(|n| n.trim().parse::<usize>().unwrap())
+    });
     let mut rest = String::new();
-    reader.read_to_string(&mut rest).unwrap();
+    match length {
+        Some(n) => {
+            let mut body = vec![0; n];
+            reader.read_exact(&mut body).unwrap();
+            rest = String::from_utf8(body).unwrap();
+        }
+        None => {
+            reader.read_to_string(&mut rest).unwrap();
+        }
+    }
     (head, rest)
 }
 
@@ -370,14 +389,27 @@ fn refuses_a_body_over_its_limit() {
 }
 
 #[test]
-fn streams_unframed_to_an_http_1_0_client() {
+fn streams_to_an_http_1_0_client_as_one_framed_body() {
     let url = start(fake(&[(
         "a",
         Script::Quote(10, json!({"text": "old school"})),
     )]));
-    let (head, body) = raw(&url, "HTTP/1.0", &[], &chat(true));
-    assert!(head.starts_with("HTTP/1.0 200"), "{head}");
+    // Asking to keep the connection: the stream still has to end where the client sees it.
+    let (head, body) = raw(
+        &url,
+        "HTTP/1.0",
+        &[("Connection", "keep-alive")],
+        &chat(true),
+    );
+    assert!(
+        head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200"),
+        "{head}"
+    );
     assert!(!head.to_ascii_lowercase().contains("chunked"), "{head}");
+    assert!(
+        head.to_ascii_lowercase().contains("content-length"),
+        "{head}"
+    );
     assert!(body.starts_with("data: {"), "{body}");
     assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
 }

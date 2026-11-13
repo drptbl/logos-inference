@@ -67,6 +67,8 @@ pub struct Fake {
     pub pay_mode: Mutex<PayMode>,
     /// Finds that come back empty before the providers show.
     pub find_misses: Mutex<u32>,
+    /// How long each job check takes.
+    pub job_delay: Mutex<Duration>,
     jobs: Mutex<HashMap<String, (Script, Money)>>,
     pub log: Mutex<Log>,
 }
@@ -79,6 +81,7 @@ pub fn fake(providers: &[(&str, Script)]) -> Fake {
             .collect(),
         pay_mode: Mutex::new(PayMode::Pays),
         find_misses: Mutex::new(0),
+        job_delay: Mutex::new(Duration::ZERO),
         jobs: Mutex::default(),
         log: Mutex::default(),
     }
@@ -130,6 +133,7 @@ impl Agent for Fake {
     }
 
     fn job(&self, job: &str) -> Result<Option<JobState>, String> {
+        std::thread::sleep(*self.job_delay.lock().unwrap());
         let mut jobs = self.jobs.lock().unwrap();
         let Some((script, money)) = jobs.get_mut(job) else {
             return Ok(None);

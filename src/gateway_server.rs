@@ -169,80 +169,83 @@ impl<A: Agent> State<A> {
     /// as one chunk. Written straight to the socket, since tiny_http buffers what it sends.
     ///
     /// A client that leaves is noticed at the next keep-alive, and nothing more is paid for it.
-    /// An HTTP/1.0 client gets the stream unframed, ended by closing the connection.
     fn stream(&self, request: tiny_http::Request, call: &Call) {
-        let (done, answer) = mpsc::channel();
         let deadline = Instant::now() + self.config.timeout;
+        // An HTTP/1.0 client can't read a chunked body, and an unframed one only ends when the
+        // connection closes, which tiny_http may not do: it gets the events whole, with their
+        // length, once the answer is in.
+        if request.http_version() == &tiny_http::HTTPVersion(1, 0) {
+            let result = self
+                .gateway
+                .complete(call, deadline, &AtomicBool::new(false));
+            let header = tiny_http::Header::from_bytes("Content-Type", "text/event-stream")
+                .expect("a valid header");
+            let _ = request.respond(
+                tiny_http::Response::from_string(events(call, result)).with_header(header),
+            );
+            return;
+        }
+        let (done, answer) = mpsc::channel();
         let gone = AtomicBool::new(false);
-        let chunked = request.http_version() != &tiny_http::HTTPVersion(1, 0);
         thread::scope(|scope| {
-            scope.spawn(|| {
-                let _ = done.send(self.gateway.complete(call, deadline, &gone));
+            let gone = &gone;
+            // The sender moves into the worker, so a worker that dies ends the wait below.
+            scope.spawn(move || {
+                let _ = done.send(self.gateway.complete(call, deadline, gone));
             });
             let mut socket = request.into_writer();
-            let head = if chunked {
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n\r\n"
-            } else {
-                "HTTP/1.0 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
-            };
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n\r\n";
             let mut open = socket
                 .write_all(head.as_bytes())
                 .and_then(|_| socket.flush())
                 .is_ok();
             let result = loop {
+                if !open {
+                    gone.store(true, Ordering::Relaxed);
+                }
                 match answer.recv_timeout(self.config.keep_alive) {
                     Ok(result) => break result,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        open = open && send(&mut socket, chunked, ": keep-alive\n\n").is_ok();
-                        if !open {
-                            gone.store(true, Ordering::Relaxed);
-                        }
+                        open = open && chunk(&mut socket, ": keep-alive\n\n").is_ok();
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
                         break Err(ApiError::new(500, "the gateway stopped"));
                     }
                 }
             };
-            if !open {
-                return;
-            }
-            let mut events = Vec::new();
-            match result {
-                Ok(text) => {
-                    let (id, created) = (completion_id(), now_s());
-                    let piece = |delta: Value, finish: Value| {
-                        json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": call.model,
-                               "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
-                    };
-                    events.push(
-                        piece(json!({"role": "assistant", "content": text}), Value::Null)
-                            .to_string(),
-                    );
-                    events.push(piece(json!({}), json!("stop")).to_string());
-                }
-                Err(e) => events.push(e.body().to_string()),
-            }
-            events.push("[DONE]".into());
-            for event in events {
-                if send(&mut socket, chunked, &format!("data: {event}\n\n")).is_err() {
-                    return;
-                }
-            }
-            if chunked {
+            if open && chunk(&mut socket, &events(call, result)).is_ok() {
                 let _ = socket.write_all(b"0\r\n\r\n").and_then(|_| socket.flush());
             }
         });
     }
 }
 
-/// Part of the stream, as one chunk of a chunked body or as it is, flushed at once.
-fn send(socket: &mut impl Write, chunked: bool, text: &str) -> io::Result<()> {
-    if chunked {
-        write!(socket, "{:x}\r\n{text}\r\n", text.len())?;
-    } else {
-        socket.write_all(text.as_bytes())?;
-    }
+/// One chunk of a chunked body, flushed at once.
+fn chunk(socket: &mut impl Write, text: &str) -> io::Result<()> {
+    write!(socket, "{:x}\r\n{text}\r\n", text.len())?;
     socket.flush()
+}
+
+/// A streamed completion's events: the whole answer as one chunk and the finish, or the
+/// error, then `[DONE]`.
+fn events(call: &Call, result: Result<String, ApiError>) -> String {
+    let mut events = Vec::new();
+    match result {
+        Ok(text) => {
+            let (id, created) = (completion_id(), now_s());
+            let piece = |delta: Value, finish: Value| {
+                json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": call.model,
+                       "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
+            };
+            events.push(
+                piece(json!({"role": "assistant", "content": text}), Value::Null).to_string(),
+            );
+            events.push(piece(json!({}), json!("stop")).to_string());
+        }
+        Err(e) => events.push(e.body().to_string()),
+    }
+    events.push("[DONE]".into());
+    events.iter().map(|e| format!("data: {e}\n\n")).collect()
 }
 
 /// The body of a JSON request. Asking for JSON keeps web pages out too: a browser sends it

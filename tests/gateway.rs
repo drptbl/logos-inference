@@ -298,3 +298,17 @@ fn says_the_job_still_runs_when_the_answer_misses_the_deadline() {
     assert!(!e.retryable);
     assert!(g.agent.log.lock().unwrap().cancels.is_empty());
 }
+
+#[test]
+fn never_pays_a_quote_that_comes_after_the_deadline() {
+    let g = gateway(fake(&[("a", Script::Quote(100, answer("too late")))]));
+    *g.agent.job_delay.lock().unwrap() = Duration::from_millis(150);
+    let e = ask(&g, Duration::from_millis(100)).unwrap_err();
+    assert_eq!(
+        (e.status, e.message.as_str()),
+        (504, "no provider quoted in time")
+    );
+    let log = g.agent.log.lock().unwrap();
+    assert!(log.pay_calls.is_empty());
+    assert_eq!(log.cancels, ["job-a"]);
+}

@@ -80,6 +80,11 @@ impl<A: Agent> Gateway<A> {
                         self.cancel(&job);
                         return Err(left());
                     }
+                    // A quote that took the whole wait is too late to buy: the client is gone or going.
+                    if Instant::now() >= deadline {
+                        self.cancel(&job);
+                        return Err(ApiError::new(504, "no provider quoted in time"));
+                    }
                     return self.pay(&job, deadline);
                 }
                 Quote::Price(price) => {
