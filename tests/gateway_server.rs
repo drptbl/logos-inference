@@ -34,6 +34,7 @@ fn config() -> GatewayConfig {
         keep_alive: Duration::from_secs(10),
         max_calls: 16,
         send_timeout: Duration::from_secs(30),
+        read_timeout: Duration::from_secs(30),
     }
 }
 
@@ -554,49 +555,36 @@ fn lets_go_of_a_client_that_stops_reading() {
     drop(stuck);
 }
 
+/// Opens a completion request whose body never comes, and leaves it open.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn stall(url: &str) -> TcpStream {
+    let addr = url.trim_start_matches("http://");
+    let mut socket = TcpStream::connect(addr).unwrap();
+    write!(
+        socket,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: 2000\r\n\r\n{{\"model\":"
+    )
+    .unwrap();
+    socket
+}
+
+// Linux gives each connection the listener's read timeout; macOS doesn't.
+#[cfg(target_os = "linux")]
 #[test]
-fn answers_more_requests_at_once_than_it_has_workers() {
-    // One completion slot, and a few workers beside it: a slow completion holds one of them.
+fn lets_go_of_a_request_whose_body_stalls() {
     let url = start_config(
-        fake(&[("a", Script::Late(10, "slow", Duration::from_millis(800)))]),
+        fake(&[]),
         GatewayConfig {
-            max_calls: 1,
+            read_timeout: Duration::from_millis(300),
             ..config()
         },
     );
-    let slow = {
-        let url = url.clone();
-        thread::spawn(move || {
-            call(
-                "POST",
-                &format!("{url}/v1/chat/completions"),
-                Some(&chat(false)),
-                None,
-            )
-        })
-    };
-    thread::sleep(Duration::from_millis(100));
-    let others: Vec<_> = (0..20)
-        .map(|i| {
-            let url = url.clone();
-            thread::spawn(move || {
-                if i % 2 == 0 {
-                    call("GET", &format!("{url}/v1/models"), None, None).0
-                } else {
-                    call(
-                        "POST",
-                        &format!("{url}/v1/chat/completions"),
-                        Some(&chat(false)),
-                        None,
-                    )
-                    .0
-                }
-            })
-        })
-        .collect();
-    for (i, other) in others.into_iter().enumerate() {
-        let expected = if i % 2 == 0 { 200 } else { 429 };
-        assert_eq!(other.join().unwrap(), expected, "request {i}");
-    }
-    assert_eq!(slow.join().unwrap().0, 200);
+    // The body never comes: the read times out, and the request is answered and let go.
+    let mut stalled = stall(&url);
+    stalled
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut start = [0; 12];
+    stalled.read_exact(&mut start).unwrap();
+    assert_eq!(&start, b"HTTP/1.1 400");
 }

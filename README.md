@@ -110,7 +110,7 @@ Then use `http://127.0.0.1:8090/v1` as the client's base URL. The gateway starts
 | `--listen` | default `127.0.0.1:8090`. Any other address needs `LOGOS_INFERENCE_GATEWAY_KEY`, which callers then send as a bearer token. Without a key, the gateway only takes local JSON requests that don't come from a web page, so a page open in your browser can't spend from the wallet |
 | `--timeout-s`, `--quote-wait-s` | how long a completion may take, default 600, and how long each provider has to quote, default 90 |
 | `--files-root` | logos-agents' files root, for prompts and answers too big for a chat message. Default `LOGOS_MCP_FILES_ROOT`. A logos-agents the gateway starts gets it as its own |
-| `--max-calls` | the most completions bought at once, default 16. More are answered 429 until one finishes. The gateway serves on that many workers and 4 more, and further requests wait for one |
+| `--max-calls` | the most completions bought at once, default 16. More are answered 429 until one finishes |
 
 How a completion is bought:
 
@@ -123,7 +123,7 @@ When time runs out after paying, or while a payment's outcome is unclear, the ga
 
 The request is sent as `messages` and `max_tokens` (or `max_completion_tokens`). Sampling hints clients send by default, like `temperature`, `top_p` or `stop`, are dropped. What would change the kind of answer is refused: tools, `n` over 1, `response_format`, logprobs, images and audio, and so is any field the gateway doesn't know. `usage` holds estimated tokens, counted as providers price them.
 
-A prompt too big for a chat message, over about 64 KB, is put in Logos Storage and sent as its CID, and an answer delivered that way is fetched back. Both need `--files-root`. A provider quotes a CID prompt at its `--max-input-tokens` ceiling, so raise `--max-price-lepta` to match. Content in Logos Storage can be read by anyone who has its CID: a long prompt travels that way, unlike a short one, which goes end-to-end encrypted in the chat message. On Linux, a client that stops reading a stream is let go after 30 seconds. On macOS it holds its place under `--max-calls` until it disconnects.
+A prompt too big for a chat message, over about 64 KB, is put in Logos Storage and sent as its CID, and an answer delivered that way is fetched back. Both need `--files-root`. A provider quotes a CID prompt at its `--max-input-tokens` ceiling, so raise `--max-price-lepta` to match. Content in Logos Storage can be read by anyone who has its CID: a long prompt travels that way, unlike a short one, which goes end-to-end encrypted in the chat message. On Linux, a client that stops reading a stream, or stops sending its request, is let go after 30 seconds. On macOS it holds its thread, and a completion's place under `--max-calls`, until it disconnects.
 
 ## How a job runs
 
