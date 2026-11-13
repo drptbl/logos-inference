@@ -88,6 +88,12 @@ fn reads_each_state_a_buyer_sees() {
         job_state(&jobs(json!({"job": "j2", "state": "paid"})), "j1"),
         None
     );
+    // A job the same wallet runs as provider, under the same id, isn't the buyer's.
+    let both = json!({"jobs": [
+        {"job": "j1", "role": "provider", "state": "delivered", "output": {"text": "theirs"}},
+        {"job": "j1", "role": "buyer", "state": "paid"},
+    ]});
+    assert_eq!(job_state(&both, "j1"), Some(JobState::Paid));
 }
 
 #[test]

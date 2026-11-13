@@ -22,6 +22,8 @@ pub struct McpAgent {
     files_root: Option<PathBuf>,
     /// The last `service_jobs` listing, shared by every waiting call.
     jobs: Fresh<Result<Value, String>>,
+    /// Held while an answer downloads.
+    fetching: Mutex<()>,
 }
 
 /// How long a `service_jobs` listing serves every call before it is asked again.
@@ -97,6 +99,7 @@ impl McpAgent {
             runtime,
             files_root,
             jobs: Fresh::new(JOBS_FRESH),
+            fetching: Mutex::new(()),
         }
     }
 
@@ -106,9 +109,7 @@ impl McpAgent {
             .files_root
             .as_ref()
             .ok_or("storage needs logos-agents' files root: set --files-root")?;
-        let dir = root.join("logos-inference");
-        std::fs::create_dir_all(&dir).map_err(|e| format!("can't use the files root: {e}"))?;
-        clear_leftovers(&dir, LEFTOVER_AGE);
+        clear_leftovers(&scratch_dir(root)?, LEFTOVER_AGE);
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -121,6 +122,23 @@ impl McpAgent {
     }
 
     /// Waits for a storage transfer to finish, and returns its record.
+    /// Calls a storage tool within what's left until `until`.
+    fn storage(
+        &self,
+        name: &'static str,
+        arguments: Value,
+        until: Instant,
+    ) -> Result<Value, String> {
+        let left = until
+            .saturating_duration_since(Instant::now())
+            .min(TOOL_TIMEOUT);
+        if left.is_zero() {
+            return Err("no time was left for storage".into());
+        }
+        self.tool_within(name, arguments, left)
+            .map_err(ToolError::text)
+    }
+
     /// Waits until `until` at the latest for a storage transfer to finish, and returns its
     /// record. A download bigger than `cap` is given up on as soon as storage says how big.
     fn transfer(&self, session: &Value, until: Instant, cap: Option<u64>) -> Result<Value, String> {
@@ -128,16 +146,15 @@ impl McpAgent {
             .as_str()
             .ok_or("storage gave no session")?
             .to_string();
+        let until = until.min(Instant::now() + TRANSFER_TIMEOUT);
         let status = || {
-            self.tool("storage_transfer_status", json!({ "session_id": session }))
-                .map_err(ToolError::text)
+            self.storage(
+                "storage_transfer_status",
+                json!({ "session_id": session }),
+                until,
+            )
         };
-        wait_transfer(
-            status,
-            until.min(Instant::now() + TRANSFER_TIMEOUT),
-            cap,
-            TRANSFER_POLL,
-        )
+        wait_transfer(status, until, cap, TRANSFER_POLL)
     }
 
     /// Checks that `address` is one of the wallet's public agent accounts, which is what
@@ -151,6 +168,16 @@ impl McpAgent {
 
     /// Calls a tool and reads its JSON answer.
     fn tool(&self, name: &'static str, arguments: Value) -> Result<Value, ToolError> {
+        self.tool_within(name, arguments, TOOL_TIMEOUT)
+    }
+
+    /// Calls a tool, waiting at most `limit` for its answer.
+    fn tool_within(
+        &self,
+        name: &'static str,
+        arguments: Value,
+        limit: Duration,
+    ) -> Result<Value, ToolError> {
         let arguments: Map<String, Value> = match arguments {
             Value::Object(map) => map,
             _ => Map::new(),
@@ -160,13 +187,8 @@ impl McpAgent {
             .call_tool(CallToolRequestParams::new(name).with_arguments(arguments));
         let result = self
             .runtime
-            .block_on(async { tokio::time::timeout(TOOL_TIMEOUT, call).await })
-            .map_err(|_| {
-                ToolError::Failed(format!(
-                    "{name} didn't answer in {}s",
-                    TOOL_TIMEOUT.as_secs()
-                ))
-            })?
+            .block_on(async { tokio::time::timeout(limit, call).await })
+            .map_err(|_| ToolError::Failed(format!("{name} didn't answer in time")))?
             .map_err(|e| ToolError::Failed(format!("{name}: {e}")))?;
         let text: String = result
             .content
@@ -243,10 +265,7 @@ impl Agent for McpAgent {
         let file = root.join(&name);
         let uploaded = std::fs::write(&file, text)
             .map_err(|e| format!("can't write the prompt for storage: {e}"))
-            .and_then(|_| {
-                self.tool("storage_upload", json!({ "path": name }))
-                    .map_err(ToolError::text)
-            })
+            .and_then(|_| self.storage("storage_upload", json!({ "path": name }), until))
             .and_then(|session| self.transfer(&session, until, None));
         // Removed whatever happened: an upload still reading it keeps its open handle.
         let _ = std::fs::remove_file(&file);
@@ -256,12 +275,18 @@ impl Agent for McpAgent {
             .ok_or_else(|| "storage gave no CID".into())
     }
 
+    /// One at a time: logos-mcp keeps one transfer record per CID, so two downloads of the same
+    /// answer would read each other's progress.
     fn fetch(&self, cid: &str, until: Instant) -> Result<String, String> {
+        let _turn = self.fetching.lock().unwrap_or_else(|e| e.into_inner());
         let (root, name) = self.scratch("out")?;
         let file = root.join(&name);
         let fetched = self
-            .tool("storage_download", json!({ "cid": cid, "path": name }))
-            .map_err(ToolError::text)
+            .storage(
+                "storage_download",
+                json!({ "cid": cid, "path": name }),
+                until,
+            )
             .and_then(|session| self.transfer(&session, until, Some(MAX_FETCH)))
             .and_then(|_| read_capped(&file));
         // A download still going lands later: `scratch` clears it once it's old.
@@ -291,6 +316,9 @@ pub fn wait_transfer(
     poll: Duration,
 ) -> Result<Value, String> {
     loop {
+        if Instant::now() >= until {
+            return Err("the transfer didn't finish in time".into());
+        }
         let now = status()?;
         if let (Some(cap), Some(total)) = (cap, now["total"].as_u64())
             && total > cap
@@ -310,11 +338,19 @@ pub fn wait_transfer(
                     .to_string())
             };
         }
-        if Instant::now() >= until {
-            return Err("the transfer didn't finish in time".into());
-        }
         std::thread::sleep(poll);
     }
+}
+
+/// The gateway's folder in the files root, made if needed. It is written to and cleared out,
+/// so it must be a folder of its own, never a link out of the root.
+fn scratch_dir(root: &Path) -> Result<PathBuf, String> {
+    let dir = root.join("logos-inference");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("can't use the files root: {e}"))?;
+    if !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+        return Err(format!("{} isn't a folder of its own", dir.display()));
+    }
+    Ok(dir)
 }
 
 /// Removes files in `dir` older than `age`: left by transfers that ran past their wait.
@@ -392,10 +428,11 @@ pub fn providers(found: &Value) -> Vec<Provider> {
 
 /// A job's state from what `service_jobs` lists, if it lists the job.
 pub fn job_state(jobs: &Value, job: &str) -> Option<JobState> {
+    // The buyer's: a wallet that also provides can hold the same id as provider.
     let found = jobs["jobs"]
         .as_array()?
         .iter()
-        .find(|j| j["job"] == json!(job))?;
+        .find(|j| j["job"] == json!(job) && j["role"] != json!("provider"))?;
     let reason = || {
         found["reason"]
             .as_str()
@@ -479,6 +516,26 @@ pub fn payer(accounts: &Value, address: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_scratch_folder_that_links_out_of_the_root() {
+        let base =
+            std::env::temp_dir().join(format!("logos-inference-links-{}", std::process::id()));
+        let (root, elsewhere) = (base.join("root"), base.join("elsewhere"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        assert_eq!(scratch_dir(&root), Ok(root.join("logos-inference")));
+        let linked = base.join("linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, linked.join("logos-inference")).unwrap();
+        assert!(
+            scratch_dir(&linked)
+                .unwrap_err()
+                .ends_with("isn't a folder of its own")
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 
     #[test]
     fn clears_only_files_older_than_the_age() {
