@@ -10,6 +10,9 @@ buyer agent finds the offer and asks for three jobs:
 2. a chat request with its own max_tokens, quoted lower, paid, answered and claimed
 3. a chat request over the offer's output cap, turned away before anyone pays
 
+Then the buyer's wallet goes behind `logos-inference gateway`, and an OpenAI client buys
+two completions through it, one of them streamed.
+
 Run `logos-devnet up` in this repo first, with logos-devnet and logosctl on PATH, a
 logos-agents v0.4.0 checkout (for its demo helpers) and its binary, and the model
 running on the backend. Exits non-zero if a job does not go as described.
@@ -24,6 +27,7 @@ import sys
 import tempfile
 import time
 import tomllib
+import urllib.request
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -55,14 +59,19 @@ def write_offers(source, path, service, base):
 
 
 def serve_model(args, logs):
-    """Starts logos-inference on a free port and returns its URL."""
-    log = os.path.join(logs, "inference.log")
-    server = subprocess.Popen(
+    """Starts logos-inference serve on a free port and returns it with its URL."""
+    return start_listening(
         [args.bin, "serve", "--backend", args.backend, "--model", args.model,
          "--input-lepta-per-token", str(INPUT_RATE), "--output-lepta-per-token", str(OUTPUT_RATE),
          "--max-tokens", str(MAX_TOKENS), "--listen", "127.0.0.1:0"],
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=open(log, "w"))
-    deadline = time.time() + 30
+        os.path.join(logs, "inference.log"), os.environ, 30)
+
+
+def start_listening(cmd, log, env, wait):
+    """Starts a logos-inference command and returns it with the URL it says it listens on."""
+    server = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=open(log, "w"))
+    deadline = time.time() + wait
     while time.time() < deadline:
         with open(log) as f:
             if found := re.search(r"on (http://127\.0\.0\.1:\d+)", f.read()):
@@ -70,7 +79,18 @@ def serve_model(args, logs):
         if server.poll() is not None:
             sys.exit(f"logos-inference stopped: see {log}")
         time.sleep(0.2)
-    sys.exit("logos-inference didn't start listening")
+    sys.exit(f"logos-inference didn't start listening: see {log}")
+
+
+def openai(url, path, body=None, timeout=600):
+    """An OpenAI-style call: the status and the body as text."""
+    data = json.dumps(body).encode() if body is not None else None
+    ask = urllib.request.Request(url + path, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(ask, timeout=timeout) as r:
+            return r.status, r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
 
 
 def main():
@@ -114,7 +134,7 @@ def main():
         LOGOS_MCP_DISCOVERY_BOOTSTRAP=sides.bootstrap,
         LOGOS_AGENTS_FOLLOW_THROUGH_SECS=str(args.poll),
     )
-    provider = buyer = None
+    provider = buyer = gateway = None
     try:
         provider = subprocess.Popen([args.agents_bin, "provide", offers], env=provider_env, stdin=subprocess.DEVNULL,
                                     stdout=subprocess.DEVNULL, stderr=open(os.path.join(logs, "provider.log"), "w"))
@@ -158,7 +178,53 @@ def main():
         if turned.get("state") != "rejected" or f"at most {MAX_TOKENS}" not in (turned.get("reason") or ""):
             sys.exit(f"a request over the cap came back as {turned}")
         demo.log(f"[provider] turned away a request over the cap: {turned['reason']!r}")
+
+        # One logos-agents per wallet: the buyer's goes behind the gateway now.
+        buyer.close()
+        buyer = None
+        buyer_env = dict(
+            os.environ,
+            LOGOSCTL_CONFIG_DIR=sides.buyer_session,
+            LOGOS_MCP_PRESET="logos.dev",
+            LOGOS_MCP_WALLET_CONFIG=os.path.join(sides.buyer_wallet, "wallet_config.json"),
+            LOGOS_MCP_WALLET_STORAGE=os.path.join(sides.buyer_wallet, "storage.json"),
+            LOGOS_MCP_DISCOVERY_BOOTSTRAP=sides.bootstrap,
+            LOGOS_AGENTS_FOLLOW_THROUGH_SECS=str(args.poll),
+        )
+        gateway, gateway_url = start_listening(
+            [args.bin, "gateway", "--model", args.model, "--max-price-lepta", "100000",
+             "--pay-from", sides.buyer_from, "--agents-bin", args.agents_bin, "--listen", "127.0.0.1:0",
+             "--timeout-s", str(args.timeout)],
+            os.path.join(logs, "gateway.log"), buyer_env, 120)
+        demo.log(f"[buyer] logos-inference gateway on {gateway_url}")
+        status, body = openai(gateway_url, "/v1/models")
+        if status != 200 or args.model not in [m["id"] for m in json.loads(body)["data"]]:
+            sys.exit(f"/v1/models answered {status}: {body}")
+
+        def completion(stream):
+            started = time.time()
+            status, body = openai(gateway_url, "/v1/chat/completions", {
+                "model": args.model, "stream": stream, "max_tokens": 8, "temperature": 0,
+                "messages": [{"role": "user", "content": "Name a colour."}]}, timeout=args.timeout + 30)
+            if status != 200:
+                sys.exit(f"the gateway answered {status}: {body}")
+            if stream:
+                events = [line[len("data: "):] for line in body.splitlines() if line.startswith("data: ")]
+                if events[-1:] != ["[DONE]"]:
+                    sys.exit(f"the stream didn't end with [DONE]: {body}")
+                text = "".join(json.loads(e)["choices"][0]["delta"].get("content") or "" for e in events[:-1])
+            else:
+                text = json.loads(body)["choices"][0]["message"]["content"]
+            if not text.strip():
+                sys.exit(f"the gateway's answer was empty: {body}")
+            how = "streamed" if stream else "answered"
+            demo.log(f"[buyer] an OpenAI client was {how} {text!r} in {time.time() - started:.0f}s")
+
+        completion(stream=False)
+        completion(stream=True)
     finally:
+        if gateway:
+            gateway.terminate()
         inference.terminate()
         if buyer:
             buyer.close()
