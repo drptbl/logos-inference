@@ -8,10 +8,22 @@ use serde_json::{Map, Value, json};
 #[derive(Debug)]
 pub struct Call {
     pub model: String,
-    /// The job input: a chat request in the provider wire format.
-    pub input: String,
-    pub stream: bool,
     pub messages: Vec<Message>,
+    /// The output cap the client asked for, if any: the offer's otherwise.
+    pub max_tokens: Option<u32>,
+    pub stream: bool,
+}
+
+impl Call {
+    /// The job input: a chat request in the provider wire format.
+    pub fn input(&self) -> String {
+        let mut input = Map::new();
+        input.insert("messages".into(), json!(self.messages));
+        if let Some(cap) = self.max_tokens {
+            input.insert("max_tokens".into(), json!(cap));
+        }
+        Value::Object(input).to_string()
+    }
 }
 
 /// An error as OpenAI clients read it.
@@ -21,6 +33,9 @@ pub struct ApiError {
     pub message: String,
     pub param: Option<String>,
     pub code: Option<String>,
+    /// Whether a client may simply try again. Not when money may have moved: trying again
+    /// would buy the answer a second time.
+    pub retryable: bool,
 }
 
 impl ApiError {
@@ -30,6 +45,7 @@ impl ApiError {
             message: message.into(),
             param: None,
             code: None,
+            retryable: true,
         }
     }
 
@@ -47,12 +63,17 @@ impl ApiError {
         }
     }
 
+    pub fn not_retryable(self) -> ApiError {
+        ApiError {
+            retryable: false,
+            ..self
+        }
+    }
+
     /// The JSON body OpenAI answers an error with.
     pub fn body(&self) -> Value {
         let kind = match self.status {
-            401 => "authentication_error",
-            402 => "insufficient_quota",
-            404 | 400 | 413 => "invalid_request_error",
+            400..=499 => "invalid_request_error",
             _ => "api_error",
         };
         json!({"error": {"message": self.message, "type": kind, "param": self.param, "code": self.code}})
@@ -75,6 +96,10 @@ const DROPPED: &[&str] = &[
     "store",
     "service_tier",
     "parallel_tool_calls",
+    "reasoning_effort",
+    "verbosity",
+    "prompt_cache_key",
+    "safety_identifier",
 ];
 
 /// Reads a chat completion request for one of `models`. Anything that would change the
@@ -121,16 +146,11 @@ pub fn translate(body: &[u8], models: &[String]) -> Result<Call, ApiError> {
         Some(Value::Bool(b)) => *b,
         Some(_) => return Err(ApiError::invalid("stream", "stream is true or false")),
     };
-    let mut input = Map::new();
-    input.insert("messages".into(), json!(messages));
-    if let Some(cap) = max_tokens {
-        input.insert("max_tokens".into(), json!(cap));
-    }
     Ok(Call {
         model: model.into(),
-        input: Value::Object(input).to_string(),
-        stream,
         messages,
+        max_tokens,
+        stream,
     })
 }
 

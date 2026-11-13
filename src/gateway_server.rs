@@ -3,12 +3,12 @@
 
 use crate::agent::Agent;
 use crate::gateway::Gateway;
-use crate::job::Prompt;
+use crate::job::{Prompt, estimate_tokens};
 use crate::openai::{ApiError, Call, translate};
 use serde_json::{Value, json};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -33,9 +33,6 @@ struct State<A: Agent> {
     gateway: Gateway<A>,
     config: GatewayConfig,
 }
-
-/// The largest request body read.
-const MAX_BODY: u64 = 16 << 20;
 
 impl<A: Agent + 'static> GatewayServer<A> {
     /// Listens on `addr`. Every completion spends from the wallet, so an address beyond this
@@ -72,11 +69,8 @@ impl<A: Agent + 'static> GatewayServer<A> {
 
 impl<A: Agent> State<A> {
     fn handle(&self, mut request: tiny_http::Request) {
-        if !self.authorized(&request) {
-            return respond(
-                request,
-                Err(ApiError::new(401, "a valid API key is required")),
-            );
+        if let Err(e) = self.admit(&request) {
+            return respond(request, Err(e));
         }
         let path = request
             .url()
@@ -96,13 +90,16 @@ impl<A: Agent> State<A> {
             }
             (tiny_http::Method::Post, "/v1/chat/completions") => {
                 let call =
-                    read_body(&mut request).and_then(|body| translate(&body, &self.config.models));
+                    json_body(&mut request).and_then(|body| translate(&body, &self.config.models));
                 match call {
                     Ok(call) if call.stream => self.stream(request, &call),
                     Ok(call) => {
-                        let answer = self
-                            .gateway
-                            .complete(&call, Instant::now() + self.config.timeout);
+                        // tiny_http can't tell when a client leaves mid-request.
+                        let answer = self.gateway.complete(
+                            &call,
+                            Instant::now() + self.config.timeout,
+                            &AtomicBool::new(false),
+                        );
                         respond(request, answer.map(|text| completion(&call, &text)))
                     }
                     Err(e) => respond(request, Err(e)),
@@ -115,37 +112,79 @@ impl<A: Agent> State<A> {
         }
     }
 
-    fn authorized(&self, request: &tiny_http::Request) -> bool {
-        let Some(key) = &self.config.key else {
-            return true;
+    /// Lets a request in. With a key, only callers that send it. Without one, only local
+    /// clients that aren't web pages: a page in the user's browser can reach localhost, but its
+    /// requests carry an `Origin`, and a page using DNS rebinding sends its own name as `Host`.
+    fn admit(&self, request: &tiny_http::Request) -> Result<(), ApiError> {
+        let header = |name: &'static str| {
+            request
+                .headers()
+                .iter()
+                .find(|h| h.field.equiv(name))
+                .map(|h| h.value.as_str().to_string())
         };
-        let given = request
-            .headers()
-            .iter()
-            .find(|h| h.field.equiv("Authorization"))
-            .map(|h| h.value.as_str().to_string())
-            .unwrap_or_default();
-        let expected = format!("Bearer {key}");
-        // Compared in full whatever matches, so the time taken doesn't tell how much did.
-        given.len() == expected.len()
-            && given
-                .bytes()
-                .zip(expected.bytes())
-                .fold(0, |acc, (a, b)| acc | (a ^ b))
-                == 0
+        if let Some(key) = &self.config.key {
+            let given = header("Authorization").unwrap_or_default();
+            let token = match given.split_once(' ') {
+                Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") => token,
+                _ => "",
+            };
+            // Compared in full whatever matches, so the time taken doesn't tell how much did.
+            let matches = token.len() == key.len()
+                && token
+                    .bytes()
+                    .zip(key.bytes())
+                    .fold(0, |acc, (a, b)| acc | (a ^ b))
+                    == 0;
+            return if matches {
+                Ok(())
+            } else {
+                Err(ApiError::new(401, "a valid API key is required").code("invalid_api_key"))
+            };
+        }
+        if header("Origin").is_some() {
+            return Err(ApiError::new(
+                403,
+                "requests from web pages need a key: set LOGOS_INFERENCE_GATEWAY_KEY",
+            ));
+        }
+        let host = header("Host").unwrap_or_default();
+        let name = match host.rsplit_once(':') {
+            Some((name, port)) if port.bytes().all(|b| b.is_ascii_digit()) => name,
+            _ => host.as_str(),
+        };
+        if !matches!(
+            name.to_ascii_lowercase().as_str(),
+            "127.0.0.1" | "localhost" | "[::1]"
+        ) {
+            return Err(ApiError::new(
+                403,
+                format!("{host} isn't this machine's name"),
+            ));
+        }
+        Ok(())
     }
 
     /// Streams the completion: keep-alive comments while it's bought, then the whole answer
     /// as one chunk. Written straight to the socket, since tiny_http buffers what it sends.
+    ///
+    /// A client that leaves is noticed at the next keep-alive, and nothing more is paid for it.
+    /// An HTTP/1.0 client gets the stream unframed, ended by closing the connection.
     fn stream(&self, request: tiny_http::Request, call: &Call) {
         let (done, answer) = mpsc::channel();
         let deadline = Instant::now() + self.config.timeout;
+        let gone = AtomicBool::new(false);
+        let chunked = request.http_version() != &tiny_http::HTTPVersion(1, 0);
         thread::scope(|scope| {
             scope.spawn(|| {
-                let _ = done.send(self.gateway.complete(call, deadline));
+                let _ = done.send(self.gateway.complete(call, deadline, &gone));
             });
             let mut socket = request.into_writer();
-            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n\r\n";
+            let head = if chunked {
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n\r\n"
+            } else {
+                "HTTP/1.0 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
+            };
             let mut open = socket
                 .write_all(head.as_bytes())
                 .and_then(|_| socket.flush())
@@ -154,7 +193,10 @@ impl<A: Agent> State<A> {
                 match answer.recv_timeout(self.config.keep_alive) {
                     Ok(result) => break result,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        open = open && chunk(&mut socket, ": keep-alive\n\n").is_ok();
+                        open = open && send(&mut socket, chunked, ": keep-alive\n\n").is_ok();
+                        if !open {
+                            gone.store(true, Ordering::Relaxed);
+                        }
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
                         break Err(ApiError::new(500, "the gateway stopped"));
@@ -182,45 +224,58 @@ impl<A: Agent> State<A> {
             }
             events.push("[DONE]".into());
             for event in events {
-                if chunk(&mut socket, &format!("data: {event}\n\n")).is_err() {
+                if send(&mut socket, chunked, &format!("data: {event}\n\n")).is_err() {
                     return;
                 }
             }
-            let _ = socket.write_all(b"0\r\n\r\n").and_then(|_| socket.flush());
+            if chunked {
+                let _ = socket.write_all(b"0\r\n\r\n").and_then(|_| socket.flush());
+            }
         });
     }
 }
 
-/// One chunk of a chunked body, flushed at once.
-fn chunk(socket: &mut impl Write, text: &str) -> io::Result<()> {
-    write!(socket, "{:x}\r\n{text}\r\n", text.len())?;
+/// Part of the stream, as one chunk of a chunked body or as it is, flushed at once.
+fn send(socket: &mut impl Write, chunked: bool, text: &str) -> io::Result<()> {
+    if chunked {
+        write!(socket, "{:x}\r\n{text}\r\n", text.len())?;
+    } else {
+        socket.write_all(text.as_bytes())?;
+    }
     socket.flush()
 }
 
-fn read_body(request: &mut tiny_http::Request) -> Result<Vec<u8>, ApiError> {
-    let mut body = Vec::new();
-    request
-        .as_reader()
-        .take(MAX_BODY + 1)
-        .read_to_end(&mut body)
-        .map_err(|_| ApiError::new(400, "the request couldn't be read"))?;
-    if body.len() as u64 > MAX_BODY {
-        return Err(ApiError::new(413, "the request is too big"));
+/// The body of a JSON request. Asking for JSON keeps web pages out too: a browser sends it
+/// only after a CORS preflight, which this server never answers.
+fn json_body(request: &mut tiny_http::Request) -> Result<Vec<u8>, ApiError> {
+    let json = request.headers().iter().any(|h| {
+        h.field.equiv("Content-Type")
+            && h.value
+                .as_str()
+                .to_ascii_lowercase()
+                .starts_with("application/json")
+    });
+    if !json {
+        return Err(ApiError::new(415, "send the request as application/json"));
     }
-    Ok(body)
+    crate::http::read_body(request).map_err(|(status, reason)| ApiError::new(status, reason))
 }
 
 fn respond(request: tiny_http::Request, answer: Result<Value, ApiError>) {
-    let (status, body) = match answer {
-        Ok(body) => (200, body),
-        Err(e) => (e.status, e.body()),
+    let (status, body, retry) = match answer {
+        Ok(body) => (200, body, true),
+        Err(e) => (e.status, e.body(), e.retryable),
     };
-    let response = tiny_http::Response::from_string(body.to_string())
+    let header = |name: &str, value: &str| {
+        tiny_http::Header::from_bytes(name, value).expect("a valid header")
+    };
+    let mut response = tiny_http::Response::from_string(body.to_string())
         .with_status_code(status)
-        .with_header(
-            tiny_http::Header::from_bytes("Content-Type", "application/json")
-                .expect("a valid header"),
-        );
+        .with_header(header("Content-Type", "application/json"));
+    if !retry {
+        // OpenAI's own SDKs read this before retrying a 5xx on their own.
+        response = response.with_header(header("x-should-retry", "false"));
+    }
     let _ = request.respond(response);
 }
 
@@ -231,7 +286,7 @@ fn completion(call: &Call, text: &str) -> Value {
         max_tokens: 0,
     }
     .input_tokens();
-    let answer = (text.len() as u64).div_ceil(4);
+    let answer = estimate_tokens(text);
     json!({
         "id": completion_id(),
         "object": "chat.completion",

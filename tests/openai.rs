@@ -17,12 +17,12 @@ fn ok(body: Value) -> logos_inference::openai::Call {
 fn refused(body: Value) -> ApiError {
     match translate(body.to_string().as_bytes(), &models()) {
         Err(e) => e,
-        Ok(call) => panic!("accepted as {}", call.input),
+        Ok(call) => panic!("accepted as {}", call.input()),
     }
 }
 
 fn wire(call: &logos_inference::openai::Call) -> Value {
-    serde_json::from_str(&call.input).unwrap()
+    serde_json::from_str(&call.input()).unwrap()
 }
 
 #[test]

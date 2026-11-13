@@ -11,10 +11,14 @@ use std::thread;
 use std::time::Duration;
 
 fn start_with(agent: Fake, key: Option<&str>, keep_alive: Duration) -> String {
+    start_full(agent, key, keep_alive, Duration::from_secs(5))
+}
+
+fn start_full(agent: Fake, key: Option<&str>, keep_alive: Duration, timeout: Duration) -> String {
     let config = GatewayConfig {
         models: vec!["tiny".into()],
         key: key.map(Into::into),
-        timeout: Duration::from_secs(5),
+        timeout,
         keep_alive,
     };
     let server = GatewayServer::bind("127.0.0.1:0", gateway(agent), config).unwrap();
@@ -117,7 +121,7 @@ fn answers_errors_as_openai_does() {
     assert_eq!(
         json_of(&body),
         json!({"error": {"message": "every quote was over the cap of 1000 lepta, the lowest 5000",
-                         "type": "insufficient_quota", "param": null, "code": null}})
+                         "type": "invalid_request_error", "param": null, "code": "price_over_cap"}})
     );
     let mut unknown = chat(false);
     unknown["model"] = json!("other");
@@ -132,37 +136,52 @@ fn answers_errors_as_openai_does() {
     assert_eq!(call("GET", &format!("{url}/v1/other"), None, None).0, 404);
 }
 
-/// A raw request, read to the end, for the event stream.
-fn raw_stream(url: &str, body: &Value) -> (String, Vec<String>) {
+/// A raw POST to the completions route, read to the end: the head and the body.
+fn raw(url: &str, version: &str, headers: &[(&str, &str)], body: &Value) -> (String, String) {
     let addr = url.trim_start_matches("http://");
     let mut socket = TcpStream::connect(addr).unwrap();
     let body = body.to_string();
-    write!(
-        socket,
-        "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+    let mut head = format!(
+        "POST /v1/chat/completions {version}\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len()
-    )
-    .unwrap();
+    );
+    let mut sent = vec![("Host", addr), ("Content-Type", "application/json")];
+    for (name, value) in headers {
+        sent.retain(|(n, _)| n != name);
+        sent.push((name, value));
+    }
+    for (name, value) in sent {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    write!(socket, "{head}\r\n{body}").unwrap();
     let mut reader = BufReader::new(socket);
     let mut head = String::new();
     loop {
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
-        if line == "\r\n" {
+        if line == "\r\n" || line.is_empty() {
             break;
         }
         head.push_str(&line);
     }
     let mut rest = String::new();
     reader.read_to_string(&mut rest).unwrap();
+    (head, rest)
+}
+
+/// A streamed completion read to the end: the head, and the stream's lines.
+fn raw_stream(url: &str, body: &Value) -> (String, Vec<String>) {
+    let (head, rest) = raw(url, "HTTP/1.1", &[], body);
+    (head, unframe(&rest))
+}
+
+fn unframe(rest: &str) -> Vec<String> {
     // Undo the chunked framing: keep the lines that aren't chunk sizes.
-    let lines = rest
-        .split("\r\n")
+    rest.split("\r\n")
         .filter(|l| !l.is_empty() && !l.chars().all(|c| c.is_ascii_hexdigit()))
         .flat_map(|l| l.split('\n').map(str::to_string).collect::<Vec<_>>())
         .filter(|l| !l.is_empty())
-        .collect();
-    (head, lines)
+        .collect()
 }
 
 #[test]
@@ -237,10 +256,7 @@ fn asks_for_the_key_when_it_has_one() {
     for key in [None, Some("wrong")] {
         let (status, body) = call("GET", &format!("{url}/v1/models"), None, key);
         assert_eq!(status, 401, "{key:?}");
-        assert_eq!(
-            json_of(&body)["error"]["type"],
-            json!("authentication_error")
-        );
+        assert_eq!(json_of(&body)["error"]["code"], json!("invalid_api_key"));
     }
     assert_eq!(
         call("GET", &format!("{url}/v1/models"), None, Some("s3cret")).0,
@@ -264,4 +280,133 @@ fn will_not_listen_beyond_this_machine_without_a_key() {
         "listening beyond this machine needs a key: set LOGOS_INFERENCE_GATEWAY_KEY"
     );
     assert!(GatewayServer::bind("0.0.0.0:0", gateway(fake(&[])), config(Some("k"))).is_ok());
+}
+
+#[test]
+fn refuses_requests_from_web_pages_without_a_key() {
+    let url = start(fake(&[("a", Script::Quote(10, json!({"text": "x"})))]));
+    let (head, body) = raw(
+        &url,
+        "HTTP/1.1",
+        &[("Origin", "https://evil.example")],
+        &chat(false),
+    );
+    assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+    assert!(
+        body.contains("requests from web pages need a key"),
+        "{body}"
+    );
+    let (head, body) = raw(
+        &url,
+        "HTTP/1.1",
+        &[("Host", "evil.example:8090")],
+        &chat(false),
+    );
+    assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+    assert!(
+        body.contains("evil.example:8090 isn't this machine's name"),
+        "{body}"
+    );
+    let (head, _) = raw(
+        &url,
+        "HTTP/1.1",
+        &[("Content-Type", "text/plain")],
+        &chat(false),
+    );
+    assert!(head.starts_with("HTTP/1.1 415"), "{head}");
+}
+
+#[test]
+fn asks_for_the_key_on_completions_too() {
+    let url = start_with(
+        fake(&[("a", Script::Quote(10, json!({"text": "keyed"})))]),
+        Some("s3cret"),
+        Duration::from_secs(10),
+    );
+    assert_eq!(
+        call(
+            "POST",
+            &format!("{url}/v1/chat/completions"),
+            Some(&chat(false)),
+            None
+        )
+        .0,
+        401
+    );
+    let (status, body) = call(
+        "POST",
+        &format!("{url}/v1/chat/completions"),
+        Some(&chat(false)),
+        Some("s3cret"),
+    );
+    assert_eq!(status, 200, "{body}");
+    let (head, _) = raw(
+        &url,
+        "HTTP/1.1",
+        &[("Authorization", "bearer s3cret")],
+        &chat(false),
+    );
+    assert!(
+        head.starts_with("HTTP/1.1 200"),
+        "a lower-case scheme: {head}"
+    );
+}
+
+#[test]
+fn refuses_a_body_over_its_limit() {
+    let url = start(fake(&[]));
+    let mut big = chat(false);
+    big["messages"][0]["content"] = json!("a".repeat(17 << 20));
+    assert_eq!(
+        call(
+            "POST",
+            &format!("{url}/v1/chat/completions"),
+            Some(&big),
+            None
+        )
+        .0,
+        413
+    );
+}
+
+#[test]
+fn streams_unframed_to_an_http_1_0_client() {
+    let url = start(fake(&[(
+        "a",
+        Script::Quote(10, json!({"text": "old school"})),
+    )]));
+    let (head, body) = raw(&url, "HTTP/1.0", &[], &chat(true));
+    assert!(head.starts_with("HTTP/1.0 200"), "{head}");
+    assert!(!head.to_ascii_lowercase().contains("chunked"), "{head}");
+    assert!(body.starts_with("data: {"), "{body}");
+    assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+}
+
+#[test]
+fn tells_clients_not_to_retry_once_money_may_have_moved() {
+    let url = start_full(
+        fake(&[("a", Script::Hang(10))]),
+        None,
+        Duration::from_secs(10),
+        Duration::from_millis(300),
+    );
+    let (head, body) = raw(&url, "HTTP/1.1", &[], &chat(false));
+    assert!(head.starts_with("HTTP/1.1 504"), "{head}");
+    assert!(
+        head.to_ascii_lowercase().contains("x-should-retry: false"),
+        "{head}"
+    );
+    assert!(body.contains("paid, but no answer in time"), "{body}");
+    let url = start_full(
+        fake(&[("a", Script::Silent)]),
+        None,
+        Duration::from_secs(10),
+        Duration::from_millis(300),
+    );
+    let (head, _) = raw(&url, "HTTP/1.1", &[], &chat(false));
+    assert!(head.starts_with("HTTP/1.1 503"), "{head}");
+    assert!(
+        !head.to_ascii_lowercase().contains("x-should-retry"),
+        "nothing was paid: {head}"
+    );
 }

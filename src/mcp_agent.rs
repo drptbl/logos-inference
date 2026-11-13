@@ -1,17 +1,38 @@
 //! logos-agents over MCP: a server the gateway starts itself, over stdio, or one already
-//! running, such as the Basecamp module's, over HTTP.
+//! running, such as the Basecamp module's, over HTTP. What its tools answer is read as
+//! logos-agents v0.4.0 words it.
 
-use crate::agent::{Agent, JobView, Payment, Provider};
+use crate::agent::{Agent, JobState, Payment, Provider};
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::RunningService;
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::{Map, Value, json};
+use std::time::Duration;
 use tokio::runtime::Runtime;
 
 pub struct McpAgent {
-    runtime: Runtime,
+    // Dropped before the runtime, so the client can still shut its server down.
     client: RunningService<RoleClient, ()>,
+    runtime: Runtime,
+}
+
+/// How long one tool call may take. `service_pay` can wait a minute for an approval.
+const TOOL_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// A tool call that didn't answer: the tool refused, with its message, or the call failed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolError {
+    Refused(String),
+    Failed(String),
+}
+
+impl ToolError {
+    fn text(self) -> String {
+        match self {
+            ToolError::Refused(e) | ToolError::Failed(e) => e,
+        }
+    }
 }
 
 impl McpAgent {
@@ -28,7 +49,7 @@ impl McpAgent {
                 .await
                 .map_err(|e| format!("{bin} didn't start as an MCP server: {e}"))
         })?;
-        Ok(McpAgent { runtime, client })
+        Ok(McpAgent { client, runtime })
     }
 
     /// Connects to a running MCP endpoint, e.g. `http://127.0.0.1:8766/mcp`.
@@ -39,37 +60,44 @@ impl McpAgent {
                 .await
                 .map_err(|e| format!("can't reach {url}: {e}"))
         })?;
-        Ok(McpAgent { runtime, client })
+        Ok(McpAgent { client, runtime })
     }
 
-    /// Whether `address` is one of the wallet's accounts.
-    pub fn holds(&self, address: &str) -> Result<bool, String> {
-        let accounts = self.tool("wallet_accounts", json!({}))?;
-        Ok(accounts["accounts"]
-            .as_array()
-            .is_some_and(|all| all.iter().any(|a| a["address"] == json!(address))))
+    /// Checks that `address` is one of the wallet's public agent accounts, which is what
+    /// `service_pay` pays from.
+    pub fn check_payer(&self, address: &str) -> Result<(), String> {
+        let accounts = self
+            .tool("wallet_accounts", json!({}))
+            .map_err(ToolError::text)?;
+        payer(&accounts, address)
     }
 
-    /// Calls a tool and reads its JSON answer. A tool error comes back as its text.
-    fn tool(&self, name: &'static str, arguments: Value) -> Result<Value, String> {
+    /// Calls a tool and reads its JSON answer.
+    fn tool(&self, name: &'static str, arguments: Value) -> Result<Value, ToolError> {
         let arguments: Map<String, Value> = match arguments {
             Value::Object(map) => map,
             _ => Map::new(),
         };
+        let call = self
+            .client
+            .call_tool(CallToolRequestParams::new(name).with_arguments(arguments));
         let result = self
             .runtime
-            .block_on(
-                self.client
-                    .call_tool(CallToolRequestParams::new(name).with_arguments(arguments)),
-            )
-            .map_err(|e| format!("{name}: {e}"))?;
+            .block_on(async { tokio::time::timeout(TOOL_TIMEOUT, call).await })
+            .map_err(|_| {
+                ToolError::Failed(format!(
+                    "{name} didn't answer in {}s",
+                    TOOL_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(|e| ToolError::Failed(format!("{name}: {e}")))?;
         let text: String = result
             .content
             .iter()
             .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
             .collect();
         if result.is_error == Some(true) {
-            return Err(text);
+            return Err(ToolError::Refused(text));
         }
         Ok(result
             .structured_content
@@ -95,63 +123,138 @@ fn runtime() -> Result<Runtime, String> {
 
 impl Agent for McpAgent {
     fn find(&self, service: &str) -> Result<Vec<Provider>, String> {
-        let found = self.tool("service_find", json!({ "service_id": service }))?;
-        Ok(found["providers"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|p| p["this_node"] != json!(true))
-            .filter_map(|p| {
-                Some(Provider {
-                    peer_id: p["peer_id"].as_str()?.to_string(),
-                    chat_address: p["chat_address"].as_str()?.to_string(),
-                })
-            })
-            .collect())
+        let found = self
+            .tool("service_find", json!({ "service_id": service }))
+            .map_err(ToolError::text)?;
+        Ok(providers(&found))
     }
 
     fn request(&self, provider: &Provider, service: &str, input: &str) -> Result<String, String> {
-        let asked = self.tool(
-            "service_request",
-            json!({ "chat_address": provider.chat_address, "service_id": service, "input_text": input }),
-        )?;
+        let asked = self
+            .tool(
+                "service_request",
+                json!({ "chat_address": provider.chat_address, "service_id": service, "input_text": input }),
+            )
+            .map_err(ToolError::text)?;
         asked["job"]
             .as_str()
             .map(str::to_string)
             .ok_or_else(|| format!("service_request answered {asked}"))
     }
 
-    fn job(&self, job: &str) -> Result<Option<JobView>, String> {
-        let jobs = self.tool("service_jobs", json!({}))?;
-        let Some(found) = jobs["jobs"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|j| j["job"] == json!(job))
-        else {
-            return Ok(None);
-        };
-        Ok(Some(JobView {
-            state: found["state"].as_str().unwrap_or_default().to_string(),
-            price_lepta: found["quote"]["price_lepta"]
-                .as_str()
-                .and_then(|p| p.parse().ok()),
-            output: found.get("output").filter(|o| !o.is_null()).cloned(),
-            reason: found["reason"].as_str().map(str::to_string),
-        }))
+    fn job(&self, job: &str) -> Result<Option<JobState>, String> {
+        let jobs = self
+            .tool("service_jobs", json!({}))
+            .map_err(ToolError::text)?;
+        Ok(job_state(&jobs, job))
     }
 
     fn pay(&self, job: &str, from: &str) -> Result<Payment, String> {
-        let paid = self.tool("service_pay", json!({ "job": job, "from": from }))?;
-        Ok(if paid["status"] == json!("awaiting_approval") {
-            Payment::AwaitingApproval
-        } else {
-            Payment::Sent
-        })
+        payment(self.tool("service_pay", json!({ "job": job, "from": from })))
     }
 
     fn cancel(&self, job: &str) -> Result<(), String> {
         self.tool("service_cancel", json!({ "job": job }))
             .map(|_| ())
+            .map_err(ToolError::text)
     }
+}
+
+/// The providers `service_find` lists, other than this node.
+pub fn providers(found: &Value) -> Vec<Provider> {
+    found["providers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|p| p["this_node"] != json!(true))
+        .filter_map(|p| {
+            Some(Provider {
+                peer_id: p["peer_id"].as_str()?.to_string(),
+                chat_address: p["chat_address"].as_str()?.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// A job's state from what `service_jobs` lists, if it lists the job.
+pub fn job_state(jobs: &Value, job: &str) -> Option<JobState> {
+    let found = jobs["jobs"]
+        .as_array()?
+        .iter()
+        .find(|j| j["job"] == json!(job))?;
+    let reason = || {
+        found["reason"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| found["state"].as_str().unwrap_or_default().to_string())
+    };
+    Some(match found["state"].as_str().unwrap_or_default() {
+        "quoted" => match found["quote"]["price_lepta"]
+            .as_str()
+            .and_then(|p| p.parse().ok())
+        {
+            Some(price_lepta) => JobState::Quoted {
+                price_lepta,
+                escrow: found["quote"]["escrow"].is_object(),
+            },
+            None => JobState::Ended("the quote's price can't be read".into()),
+        },
+        "paid" => JobState::Paid,
+        "delivered" => JobState::Delivered(found["output"].clone()),
+        "expired" => JobState::Expired,
+        "rejected" | "canceled" | "failed" => JobState::Ended(reason()),
+        // "requested", or a state this doesn't know: wait and see.
+        _ => JobState::Requested,
+    })
+}
+
+/// What `service_pay` did. A refusal counts as nothing sent unless logos-agents marks it as
+/// one where money may have moved, as its own payment code does. Those, a call that failed and
+/// an answer this can't read are left to the job's state to settle.
+pub fn payment(answer: Result<Value, ToolError>) -> Result<Payment, String> {
+    const MAYBE_SENT: &[&str] = &[
+        "may have been sent",
+        "may be sent",
+        "may already have gone out",
+        "may have gone out",
+        "hasn't landed yet",
+        "has just landed",
+        "provider wasn't told",
+        "another call is working",
+    ];
+    match answer {
+        Ok(paid) => match paid["status"].as_str() {
+            Some("awaiting_approval") => Ok(Payment::AwaitingApproval),
+            Some("approved_sending") => Ok(Payment::Started),
+            _ if paid.get("escrow_open_tx").is_some() || paid["paid"] == json!(true) => {
+                Ok(Payment::Started)
+            }
+            _ => Err(format!("service_pay answered {paid}")),
+        },
+        Err(ToolError::Refused(e)) if !MAYBE_SENT.iter().any(|m| e.contains(m)) => {
+            Ok(Payment::NotSent(e))
+        }
+        Err(e) => Err(e.text()),
+    }
+}
+
+/// Whether `address` is a public agent account in what `wallet_accounts` lists.
+pub fn payer(accounts: &Value, address: &str) -> Result<(), String> {
+    if !address.starts_with("Public/") {
+        return Err(format!(
+            "{address} isn't a public account: payments come from Public/<base58>"
+        ));
+    }
+    let Some(account) = accounts["accounts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|a| a["address"] == json!(address))
+    else {
+        return Err(format!("the wallet holds no account {address}"));
+    };
+    if account["agent"] != json!(true) {
+        return Err(format!("{address} isn't one of the agent's own accounts"));
+    }
+    Ok(())
 }

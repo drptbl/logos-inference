@@ -52,8 +52,9 @@ struct GatewayArgs {
     /// The longest one completion may take, in seconds.
     #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..))]
     timeout_s: u64,
-    /// How long a provider has to quote before the next one is asked, in seconds.
-    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
+    /// How long a provider has to quote before the next one is asked, in seconds. logos-agents
+    /// asks a provider again after a minute without an answer, so the default leaves room.
+    #[arg(long, default_value_t = 90, value_parser = clap::value_parser!(u64).range(1..))]
     quote_wait_s: u64,
 }
 
@@ -122,19 +123,9 @@ fn gateway(args: GatewayArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match agent.holds(&args.pay_from) {
-        Ok(true) => {}
-        Ok(false) => {
-            eprintln!(
-                "logos-inference: the wallet holds no account {}",
-                args.pay_from
-            );
-            return ExitCode::FAILURE;
-        }
-        Err(e) => {
-            eprintln!("logos-inference: can't list the wallet's accounts: {e}");
-            return ExitCode::FAILURE;
-        }
+    if let Err(e) = agent.check_payer(&args.pay_from) {
+        eprintln!("logos-inference: --pay-from: {e}");
+        return ExitCode::FAILURE;
     }
     let config = GatewayConfig {
         models: args.models,

@@ -1,7 +1,7 @@
 //! A scripted logos-agents for the gateway's tests.
 #![allow(dead_code)]
 
-use logos_inference::agent::{Agent, JobView, Payment, Provider};
+use logos_inference::agent::{Agent, JobState, Payment, Provider};
 use logos_inference::gateway::Gateway;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -11,8 +11,10 @@ use std::time::{Duration, Instant};
 /// What a scripted provider does with a request.
 #[derive(Clone)]
 pub enum Script {
-    /// Quotes this price, then answers this output once paid.
+    /// Quotes this price in escrow, then answers this output once paid.
     Quote(u128, Value),
+    /// Quotes this price without escrow.
+    QuoteNoEscrow(u128),
     /// Quotes, then fails after payment with this reason.
     FailAfterPay(u128, &'static str),
     /// Turns the request away with this reason.
@@ -23,20 +25,49 @@ pub enum Script {
     Hang(u128),
     /// Quotes, and answers this text this long after payment.
     Late(u128, &'static str, Duration),
+    /// Quotes, shows the quote expired after payment, then answers this text this long after.
+    ExpiredThenLate(u128, &'static str, Duration),
+}
+
+/// What `service_pay` does.
+#[derive(Clone)]
+pub enum PayMode {
+    /// Pays at once.
+    Pays,
+    /// Waits for an approval that comes after this many job checks, or never.
+    Approval(Option<u32>),
+    /// Errors, but the money went out: the job shows paid after this many checks.
+    ErrsButPays(&'static str, u32),
+    /// Errors, and nothing went out.
+    ErrsUnpaid(&'static str),
+    /// Refuses before sending.
+    NotSent(&'static str),
 }
 
 #[derive(Default)]
 pub struct Log {
     pub requests: Vec<String>,
-    pub payments: Vec<String>,
+    pub pay_calls: Vec<String>,
     pub cancels: Vec<String>,
+    pub finds: u32,
 }
 
-/// An agent whose providers follow their scripts. Payments wait `approvals` extra calls.
+/// Where a job's money stands.
+#[derive(Clone)]
+enum Money {
+    Unpaid,
+    /// Paid after this many more checks.
+    Coming(u32),
+    Paid(Instant),
+}
+
+/// An agent whose providers follow their scripts.
 pub struct Fake {
     pub providers: Vec<(String, Script)>,
-    pub approvals: Mutex<u32>,
-    pub jobs: Mutex<HashMap<String, (Script, Option<Instant>)>>,
+    pub pay_mode: Mutex<PayMode>,
+    /// Finds that come back empty before the providers show.
+    pub find_misses: Mutex<u32>,
+    jobs: Mutex<HashMap<String, (Script, Money)>>,
     pub log: Mutex<Log>,
 }
 
@@ -46,7 +77,8 @@ pub fn fake(providers: &[(&str, Script)]) -> Fake {
             .iter()
             .map(|(p, s)| (p.to_string(), s.clone()))
             .collect(),
-        approvals: Mutex::new(0),
+        pay_mode: Mutex::new(PayMode::Pays),
+        find_misses: Mutex::new(0),
         jobs: Mutex::default(),
         log: Mutex::default(),
     }
@@ -55,6 +87,12 @@ pub fn fake(providers: &[(&str, Script)]) -> Fake {
 impl Agent for Fake {
     fn find(&self, service: &str) -> Result<Vec<Provider>, String> {
         assert_eq!(service, "inference/tiny/v1");
+        self.log.lock().unwrap().finds += 1;
+        let mut misses = self.find_misses.lock().unwrap();
+        if *misses > 0 {
+            *misses -= 1;
+            return Ok(vec![]);
+        }
         Ok(self
             .providers
             .iter()
@@ -82,7 +120,7 @@ impl Agent for Fake {
         self.jobs
             .lock()
             .unwrap()
-            .insert(job.clone(), (script, None));
+            .insert(job.clone(), (script, Money::Unpaid));
         self.log
             .lock()
             .unwrap()
@@ -91,72 +129,73 @@ impl Agent for Fake {
         Ok(job)
     }
 
-    fn job(&self, job: &str) -> Result<Option<JobView>, String> {
-        let jobs = self.jobs.lock().unwrap();
-        let Some((script, paid_at)) = jobs.get(job) else {
+    fn job(&self, job: &str) -> Result<Option<JobState>, String> {
+        let mut jobs = self.jobs.lock().unwrap();
+        let Some((script, money)) = jobs.get_mut(job) else {
             return Ok(None);
         };
-        let view = |state: &str| JobView {
-            state: state.into(),
-            ..JobView::default()
+        if let Money::Coming(checks) = money {
+            *money = match checks {
+                0 => Money::Paid(Instant::now()),
+                n => Money::Coming(*n - 1),
+            };
+        }
+        let paid_at = match money {
+            Money::Paid(at) => Some(*at),
+            _ => None,
         };
-        Ok(Some(match (script, paid_at.is_some()) {
-            (Script::Silent, _) => view("requested"),
-            (Script::Reject(reason), _) => JobView {
-                reason: Some(reason.to_string()),
-                ..view("rejected")
-            },
+        let quoted = |price: &u128, escrow| JobState::Quoted {
+            price_lepta: *price,
+            escrow,
+        };
+        Ok(Some(match (script, paid_at) {
+            (Script::Silent, _) => JobState::Requested,
+            (Script::Reject(reason), _) => JobState::Ended(reason.to_string()),
+            (Script::QuoteNoEscrow(price), _) => quoted(price, false),
             (
                 Script::Quote(price, _)
                 | Script::FailAfterPay(price, _)
                 | Script::Hang(price)
-                | Script::Late(price, _, _),
-                false,
-            ) => JobView {
-                price_lepta: Some(*price),
-                ..view("quoted")
-            },
-            (Script::Quote(price, output), true) => JobView {
-                price_lepta: Some(*price),
-                output: Some(output.clone()),
-                ..view("delivered")
-            },
-            (Script::Late(price, text, after), true) => {
-                if paid_at.is_some_and(|at| at.elapsed() >= *after) {
-                    JobView {
-                        price_lepta: Some(*price),
-                        output: Some(json!({ "text": text })),
-                        ..view("delivered")
-                    }
-                } else {
-                    JobView {
-                        price_lepta: Some(*price),
-                        ..view("paid")
-                    }
-                }
+                | Script::Late(price, _, _)
+                | Script::ExpiredThenLate(price, _, _),
+                None,
+            ) => quoted(price, true),
+            (Script::Quote(_, output), Some(_)) => JobState::Delivered(output.clone()),
+            (Script::Late(_, text, after), Some(at)) if at.elapsed() >= *after => {
+                JobState::Delivered(json!({ "text": text }))
             }
-            (Script::Hang(price), true) => JobView {
-                price_lepta: Some(*price),
-                ..view("paid")
-            },
-            (Script::FailAfterPay(price, reason), true) => JobView {
-                price_lepta: Some(*price),
-                reason: Some(reason.to_string()),
-                ..view("failed")
-            },
+            (Script::ExpiredThenLate(_, text, after), Some(at)) if at.elapsed() >= *after => {
+                JobState::Delivered(json!({ "text": text }))
+            }
+            (Script::ExpiredThenLate(..), Some(_)) => JobState::Expired,
+            (Script::Late(..) | Script::Hang(_), Some(_)) => JobState::Paid,
+            (Script::FailAfterPay(_, reason), Some(_)) => JobState::Ended(reason.to_string()),
         }))
     }
 
     fn pay(&self, job: &str, from: &str) -> Result<Payment, String> {
         assert_eq!(from, "Public/buyer");
-        let mut approvals = self.approvals.lock().unwrap();
-        if *approvals > 0 {
-            *approvals -= 1;
-            return Ok(Payment::AwaitingApproval);
+        self.log.lock().unwrap().pay_calls.push(job.to_string());
+        let mut jobs = self.jobs.lock().unwrap();
+        let money = &mut jobs.get_mut(job).unwrap().1;
+        match self.pay_mode.lock().unwrap().clone() {
+            PayMode::Pays => {
+                *money = Money::Paid(Instant::now());
+                Ok(Payment::Started)
+            }
+            PayMode::Approval(after) => {
+                if let Some(checks) = after {
+                    *money = Money::Coming(checks);
+                }
+                Ok(Payment::AwaitingApproval)
+            }
+            PayMode::ErrsButPays(error, checks) => {
+                *money = Money::Coming(checks);
+                Err(error.into())
+            }
+            PayMode::ErrsUnpaid(error) => Err(error.into()),
+            PayMode::NotSent(reason) => Ok(Payment::NotSent(reason.into())),
         }
-        self.jobs.lock().unwrap().get_mut(job).unwrap().1 = Some(Instant::now());
-        self.log.lock().unwrap().payments.push(job.to_string());
-        Ok(Payment::Sent)
     }
 
     fn cancel(&self, job: &str) -> Result<(), String> {
