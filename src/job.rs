@@ -1,5 +1,6 @@
 //! What a job asks the model, and what that costs.
 
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -9,10 +10,13 @@ pub struct Pricing {
     pub output_lepta_per_token: u64,
     /// The most output tokens a job gets, and what it gets when it doesn't ask.
     pub max_tokens: u32,
+    /// The largest prompt the offer takes, in estimated tokens. With one, a prompt can also
+    /// come as a Logos Storage CID, quoted as if it were this big: the quote sees only the CID.
+    pub max_input_tokens: Option<u64>,
 }
 
 /// Why a request is turned away. The text goes to the buyer.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Refusal(pub String);
 
 /// One chat message, as the backend takes it and a chat request gives it.
@@ -72,18 +76,56 @@ pub enum Role {
     Assistant,
 }
 
-/// Reads a job's input, as logos-agents passes it, into a prompt. Text that is a JSON
-/// object with `messages` is a chat request; any other text is one user message. `system`
-/// is the offer's own system prompt, which goes first.
+/// What a job's input costs: a text prompt by its estimated tokens, a CID at the offer's
+/// ceiling, since logos-agents asks for the quote before it fetches the content.
+pub fn quote(input: &Value, pricing: &Pricing, system: Option<&str>) -> Result<u128, Refusal> {
+    match (input.get("cid"), pricing.max_input_tokens) {
+        (Some(_), Some(ceiling)) => Ok(ceiling as u128 * pricing.input_lepta_per_token as u128
+            + pricing.max_tokens as u128 * pricing.output_lepta_per_token as u128),
+        _ => Ok(parse(input, pricing, system)?.price(pricing)),
+    }
+}
+
+/// Reads a job's input, as logos-agents passes it, into a prompt: text, or a CID with its
+/// content as `content_b64`. Text that is a JSON object with `messages` is a chat request; any
+/// other text is one user message. `system` is the offer's own system prompt, which goes
+/// first. A prompt over the offer's ceiling is refused.
 pub fn parse(input: &Value, pricing: &Pricing, system: Option<&str>) -> Result<Prompt, Refusal> {
-    let Some(text) = input.get("text").and_then(Value::as_str) else {
-        let what = if input.get("cid").is_some() {
-            "send the prompt as text, not a CID"
-        } else {
-            "send the prompt as text"
-        };
-        return Err(Refusal(what.into()));
+    let prompt = read(&text_of(input, pricing)?, pricing, system)?;
+    if let Some(ceiling) = pricing.max_input_tokens {
+        let tokens = prompt.input_tokens();
+        if tokens > ceiling {
+            return Err(Refusal(format!(
+                "the prompt is about {tokens} tokens, over this offer's {ceiling}"
+            )));
+        }
+    }
+    Ok(prompt)
+}
+
+/// The prompt's text, given as text or fetched from its CID.
+fn text_of(input: &Value, pricing: &Pricing) -> Result<String, Refusal> {
+    if let Some(text) = input.get("text").and_then(Value::as_str) {
+        return Ok(text.to_string());
+    }
+    if input.get("cid").is_none() {
+        return Err(Refusal("send the prompt as text".into()));
+    }
+    if pricing.max_input_tokens.is_none() {
+        return Err(Refusal("send the prompt as text, not a CID".into()));
+    }
+    let Some(content) = input.get("content_b64").and_then(Value::as_str) else {
+        return Err(Refusal(
+            "the prompt's content didn't come with its CID".into(),
+        ));
     };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(content)
+        .map_err(|_| Refusal("the prompt's content isn't base64".into()))?;
+    String::from_utf8(bytes).map_err(|_| Refusal("the prompt isn't UTF-8 text".into()))
+}
+
+fn read(text: &str, pricing: &Pricing, system: Option<&str>) -> Result<Prompt, Refusal> {
     let mut messages: Vec<Message> = system
         .map(|s| Message {
             role: Role::System,

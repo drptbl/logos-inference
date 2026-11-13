@@ -88,6 +88,10 @@ struct ServeArgs {
     /// so an answer stays well under the 8 MiB logos-agents delivers.
     #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u32).range(1..=262_144))]
     max_tokens: u32,
+    /// The largest prompt taken, in estimated tokens. With it, a prompt can also come as a
+    /// Logos Storage CID, quoted as if it were this big, since the quote sees only the CID.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    max_input_tokens: Option<u64>,
     /// The request field that caps the output: max_completion_tokens for hosted models that
     /// refuse max_tokens.
     #[arg(long, value_enum, default_value_t = TokenField::MaxTokens)]
@@ -175,6 +179,7 @@ fn serve(args: ServeArgs) -> ExitCode {
             input_lepta_per_token: args.input_lepta_per_token,
             output_lepta_per_token: args.output_lepta_per_token,
             max_tokens: args.max_tokens,
+            max_input_tokens: args.max_input_tokens,
         },
         backend: Backend {
             url: args.backend,

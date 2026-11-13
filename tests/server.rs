@@ -57,11 +57,21 @@ fn start(backend: &FakeBackend, api_key: Option<&str>) -> String {
 }
 
 fn start_with(backend: &FakeBackend, api_key: Option<&str>, token_field: TokenField) -> String {
+    start_full(backend, api_key, token_field, None)
+}
+
+fn start_full(
+    backend: &FakeBackend,
+    api_key: Option<&str>,
+    token_field: TokenField,
+    max_input_tokens: Option<u64>,
+) -> String {
     let config = Config {
         pricing: Pricing {
             input_lepta_per_token: 10,
             output_lepta_per_token: 100,
             max_tokens: 64,
+            max_input_tokens,
         },
         backend: Backend {
             url: backend.url.clone(),
@@ -448,4 +458,64 @@ fn asks_to_be_retried_when_the_model_stops_with_nothing() {
         post(&format!("{url}/run"), &job("p1", "Hi")),
         (502, "the model backend gave no answer".into())
     );
+}
+
+fn b64(text: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(text)
+}
+
+#[test]
+fn quotes_a_cid_prompt_at_the_offers_ceiling() {
+    let backend = fake_backend(answering("unused"));
+    let url = start_full(&backend, None, TokenField::MaxTokens, Some(1_000));
+    // 1000 x 10 for the ceiling, and 64 x 100 for the output cap.
+    let (status, body) = post(
+        &format!("{url}/quote"),
+        &quote("q1", json!({"cid": "zDvZRwzm"})),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap(),
+        json!({"price_lepta": "16400"})
+    );
+}
+
+#[test]
+fn runs_a_cid_prompt_from_its_content() {
+    let backend = fake_backend(answering("from storage"));
+    let url = start_full(&backend, None, TokenField::MaxTokens, Some(1_000));
+    let mut paid = job("r1", "unused");
+    paid["input"] = json!({"cid": "zDvZRwzm", "content_b64": b64("What is Logos?")});
+    paid["price_lepta"] = json!("16400");
+    assert_eq!(post(&format!("{url}/run"), &paid).0, 200);
+    let asked = &backend.asked.lock().unwrap()[0].0;
+    assert_eq!(
+        asked["messages"],
+        json!([{"role": "user", "content": "What is Logos?"}])
+    );
+}
+
+#[test]
+fn declines_a_cid_prompt_over_the_ceiling_or_underpaid() {
+    let backend = fake_backend(answering("unused"));
+    let url = start_full(&backend, None, TokenField::MaxTokens, Some(1_000));
+    let mut big = job("r2", "unused");
+    big["input"] = json!({"cid": "zDvZRwzm", "content_b64": b64(&"a".repeat(5_000))});
+    big["price_lepta"] = json!("16400");
+    assert_eq!(
+        post(&format!("{url}/run"), &big),
+        (
+            422,
+            "the prompt is about 1254 tokens, over this offer's 1000".into()
+        )
+    );
+    let mut cheap = job("r3", "unused");
+    cheap["input"] = json!({"cid": "zDvZRwzm", "content_b64": b64("Hi")});
+    cheap["price_lepta"] = json!("16399");
+    assert_eq!(
+        post(&format!("{url}/run"), &cheap),
+        (422, "paid 16399 lepta, but this job costs 16400".into())
+    );
+    assert!(backend.asked.lock().unwrap().is_empty());
 }

@@ -1,7 +1,7 @@
 //! The handler logos-agents' `provide` posts to: `/quote` prices a request, `/run` answers a
 //! paid job with the model's output. See logos-agents' docs/providers.md for the contract.
 
-use crate::job::{Pricing, Prompt, Refusal, parse};
+use crate::job::{Pricing, Prompt, Refusal, parse, quote};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -184,10 +184,18 @@ impl State {
         )?)
     }
 
+    fn price(&self, ask: &Ask) -> Result<u128, Answer> {
+        let config = &self.config;
+        Ok(quote(
+            &ask.input,
+            &config.pricing,
+            config.system.as_deref(),
+        )?)
+    }
+
     fn quote(&self, ask: &Ask) -> Answer {
-        match self.prompt(ask) {
-            Ok(prompt) => {
-                let price = prompt.price(&self.config.pricing);
+        match self.price(ask) {
+            Ok(price) => {
                 eprintln!("quote {:?}: {price} lepta", ask.job);
                 Answer::json(json!({ "price_lepta": price.to_string() }))
             }
@@ -228,7 +236,7 @@ impl State {
             .and_then(|p| p.parse::<u128>().ok())
             .ok_or_else(|| Answer::reason(400, "not a job request"))?;
         let prompt = self.prompt(ask)?;
-        let price = prompt.price(&self.config.pricing);
+        let price = self.price(ask)?;
         if paid < price {
             return Err(Answer::reason(
                 422,
