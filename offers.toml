@@ -5,7 +5,8 @@ service_id = "inference/qwen2.5:0.5b/v1"
 tag = "inference"
 # The quote handler prices each request, so this is only a fallback logos-agents requires.
 price_lepta = "1"
-deliver_within_s = 600
+# logos-agents stops waiting on a job 6 minutes before its deadline: 15 minutes leaves 9.
+deliver_within_s = 900
 handler = "http://127.0.0.1:8080/run"
 quote_handler = "http://127.0.0.1:8080/quote"
 max_jobs = 2

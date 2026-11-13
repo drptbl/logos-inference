@@ -11,7 +11,8 @@ buyer agent finds the offer and asks for three jobs:
 3. a chat request over the offer's output cap, turned away before anyone pays
 
 Then the buyer's wallet goes behind `logos-inference gateway`, and an OpenAI client buys
-two completions through it, one of them streamed.
+three completions through it: one streamed, and one with a prompt too big for a chat
+message, which goes through Logos Storage and is quoted at the offer's input ceiling.
 
 Run `logos-devnet up` in this repo first, with logos-devnet and logosctl on PATH, a
 logos-agents v0.4.0 checkout (for its demo helpers) and its binary, and the model
@@ -35,6 +36,10 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INPUT_RATE = 10
 OUTPUT_RATE = 100
 MAX_TOKENS = 32
+# The largest prompt the offer takes, in estimated tokens: a CID prompt is quoted at this.
+MAX_INPUT_TOKENS = 24_000
+# A prompt over a chat message's 64 KB, so the gateway sends it through Logos Storage.
+BIG_PROMPT = "Answer with one word, the word this text repeats: " + "logos " * 11_000
 
 PROMPT = "In one sentence, what is an escrow?"
 CHAT = {"messages": [{"role": "system", "content": "Answer in at most five words."},
@@ -63,7 +68,8 @@ def serve_model(args, logs):
     return start_listening(
         [args.bin, "serve", "--backend", args.backend, "--model", args.model,
          "--input-lepta-per-token", str(INPUT_RATE), "--output-lepta-per-token", str(OUTPUT_RATE),
-         "--max-tokens", str(MAX_TOKENS), "--listen", "127.0.0.1:0"],
+         "--max-tokens", str(MAX_TOKENS), "--max-input-tokens", str(MAX_INPUT_TOKENS),
+         "--listen", "127.0.0.1:0"],
         os.path.join(logs, "inference.log"), os.environ, 30)
 
 
@@ -124,8 +130,8 @@ def main():
     offers = os.path.join(logs, "offers.toml")
     write_offers(args.offers, offers, service, base)
 
-    def side_env(session, wallet):
-        """The environment a side's logos-agents runs with, on the devnet."""
+    def side_env(session, wallet, files):
+        """The environment a side's logos-agents runs with, on the devnet, storage in `files`."""
         return dict(
             os.environ,
             LOGOSCTL_CONFIG_DIR=session,
@@ -134,9 +140,12 @@ def main():
             LOGOS_MCP_WALLET_STORAGE=os.path.join(wallet, "storage.json"),
             LOGOS_MCP_DISCOVERY_BOOTSTRAP=sides.bootstrap,
             LOGOS_AGENTS_FOLLOW_THROUGH_SECS=str(args.poll),
+            LOGOS_MCP_FILES_ROOT=files,
         )
 
-    provider_env = side_env(sides.provider_session, sides.provider_wallet)
+    provider_files = tempfile.mkdtemp(prefix="logos-inference-provider-files-")
+    buyer_files = tempfile.mkdtemp(prefix="logos-inference-buyer-files-")
+    provider_env = side_env(sides.provider_session, sides.provider_wallet, provider_files)
     provider = buyer = gateway = None
     try:
         provider = subprocess.Popen([args.agents_bin, "provide", offers], env=provider_env, stdin=subprocess.DEVNULL,
@@ -185,9 +194,9 @@ def main():
         # One logos-agents per wallet: the buyer's goes behind the gateway now.
         buyer.close()
         buyer = None
-        buyer_env = side_env(sides.buyer_session, sides.buyer_wallet)
+        buyer_env = side_env(sides.buyer_session, sides.buyer_wallet, buyer_files)
         gateway, gateway_url = start_listening(
-            [args.bin, "gateway", "--model", args.model, "--max-price-lepta", "100000",
+            [args.bin, "gateway", "--model", args.model, "--max-price-lepta", "1000000",
              "--pay-from", sides.buyer_from, "--agents-bin", args.agents_bin, "--listen", "127.0.0.1:0",
              "--timeout-s", str(args.timeout)],
             os.path.join(logs, "gateway.log"), buyer_env, 120)
@@ -196,11 +205,11 @@ def main():
         if status != 200 or args.model not in [m["id"] for m in json.loads(body)["data"]]:
             sys.exit(f"/v1/models answered {status}: {body}")
 
-        def completion(stream):
+        def completion(stream, prompt="Name a colour."):
             started = time.time()
             status, body = openai(gateway_url, "/v1/chat/completions", {
                 "model": args.model, "stream": stream, "max_tokens": 8, "temperature": 0,
-                "messages": [{"role": "user", "content": "Name a colour."}]}, timeout=args.timeout + 30)
+                "messages": [{"role": "user", "content": prompt}]}, timeout=args.timeout + 30)
             if status != 200:
                 sys.exit(f"the gateway answered {status}: {body}")
             if stream:
@@ -216,10 +225,12 @@ def main():
             if not text.strip():
                 sys.exit(f"the gateway's answer was empty: {body}")
             how = "streamed" if stream else "answered"
-            demo.log(f"[buyer] an OpenAI client was {how} {text!r} in {time.time() - started:.0f}s")
+            size = f" for a {len(prompt) // 1000} KB prompt" if len(prompt) > 1000 else ""
+            demo.log(f"[buyer] an OpenAI client was {how} {text!r}{size} in {time.time() - started:.0f}s")
 
         completion(stream=False)
         completion(stream=True)
+        completion(stream=False, prompt=BIG_PROMPT)
     finally:
         if gateway:
             gateway.terminate()

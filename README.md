@@ -31,6 +31,7 @@ logos-agents provide offers.toml
 | `--input-lepta-per-token`, `--output-lepta-per-token` | the rates |
 | `--max-tokens` | the most output tokens a job gets, default 512 |
 | `--max-tokens-field` | how the cap is sent: `max_tokens` (default), or `max_completion_tokens` for a hosted model that refuses `max_tokens` |
+| `--max-input-tokens` | the largest prompt taken, in estimated tokens. With it, a prompt can also come as a Logos Storage CID |
 | `--system` | a system prompt put before every job, paid for as input |
 | `--listen` | default `127.0.0.1:8080` |
 | `--timeout-s` | the longest a job waits on the model, default 600 |
@@ -74,7 +75,9 @@ The job's input is text, one of:
 {"messages": [{"role": "system", "content": "Answer in five words."}, {"role": "user", "content": "Name a colour."}], "max_tokens": 8}
 ```
 
-Roles are `system`, `user` and `assistant`, and `content` is a string. A chat request with anything else, or a field it doesn't name, is turned away before anyone pays, so you never pay for a parameter that would be ignored. A CID input is turned away too: the quote is made before its content is fetched. The answer is the model's text.
+Roles are `system`, `user` and `assistant`, and `content` is a string. A chat request with anything else, or a field it doesn't name, is turned away before anyone pays, so you never pay for a parameter that would be ignored. The answer is the model's text.
+
+A prompt too big for a chat message, over about 64 KB, comes as a Logos Storage CID. An offer takes those only with `--max-input-tokens`, and quotes each as if it were that big: logos-agents asks for the quote before it fetches the content. Once paid, the content reaches the handler and is read like text, and a prompt over the ceiling is declined and refunded. Run `logos-agents provide` with a files root (`LOGOS_MCP_FILES_ROOT`) for it to fetch the content.
 
 ## Pricing
 
@@ -84,7 +87,7 @@ Escrow locks one price before the output exists, so a job pays for the whole out
 price = input tokens x input rate + max_tokens x output rate
 ```
 
-Input tokens are estimated, not counted by the model's tokenizer: each message's UTF-8 bytes over 4, rounded up, plus 4. The model is asked for at most `max_tokens`, so it never does more than was paid for.
+Input tokens are estimated, not counted by the model's tokenizer: each message's UTF-8 bytes over 4, rounded up, plus 4. A prompt sent as a CID counts as `--max-input-tokens`. The model is asked for at most `max_tokens`, so it never does more than was paid for.
 
 ## Buy completions through the gateway
 
@@ -106,6 +109,8 @@ Then use `http://127.0.0.1:8090/v1` as the client's base URL. The gateway starts
 | `--agents-bin`, `--agents-url` | the logos-agents to start, default `logos-agents`, or a running one to use |
 | `--listen` | default `127.0.0.1:8090`. Any other address needs `LOGOS_INFERENCE_GATEWAY_KEY`, which callers then send as a bearer token. Without a key, the gateway only takes local JSON requests that don't come from a web page, so a page open in your browser can't spend from the wallet |
 | `--timeout-s`, `--quote-wait-s` | how long a completion may take, default 600, and how long each provider has to quote, default 90 |
+| `--files-root` | logos-agents' files root, for prompts and answers too big for a chat message. Default `LOGOS_MCP_FILES_ROOT`. A logos-agents the gateway starts gets it as its own |
+| `--max-calls` | the most completions bought at once, default 16. More are answered 429 until one finishes |
 
 How a completion is bought:
 
@@ -116,7 +121,9 @@ How a completion is bought:
 
 When time runs out after paying, or while a payment's outcome is unclear, the gateway says so and answers with `x-should-retry: false`, so OpenAI's SDKs don't buy the answer a second time. The job goes on in logos-agents, which keeps its answer or refunds the escrow.
 
-The request is sent as `messages` and `max_tokens` (or `max_completion_tokens`). Sampling hints clients send by default, like `temperature`, `top_p` or `stop`, are dropped. What would change the kind of answer is refused: tools, `n` over 1, `response_format`, logprobs, images and audio, and so is any field the gateway doesn't know. `usage` holds estimated tokens, counted as providers price them. An answer delivered through Logos Storage, over about 60 KB, comes back as an error for now.
+The request is sent as `messages` and `max_tokens` (or `max_completion_tokens`). Sampling hints clients send by default, like `temperature`, `top_p` or `stop`, are dropped. What would change the kind of answer is refused: tools, `n` over 1, `response_format`, logprobs, images and audio, and so is any field the gateway doesn't know. `usage` holds estimated tokens, counted as providers price them.
+
+A prompt too big for a chat message, over about 64 KB, is put in Logos Storage and sent as its CID, and an answer delivered that way is fetched back. Both need `--files-root`. A provider quotes a CID prompt at its `--max-input-tokens` ceiling, so raise `--max-price-lepta` to match. Content in Logos Storage can be read by anyone who has its CID: a long prompt travels that way, unlike a short one, which goes end-to-end encrypted in the chat message. On Linux, a client that stops reading a stream is let go after 30 seconds. On macOS it holds its place under `--max-calls` until it disconnects.
 
 ## How a job runs
 

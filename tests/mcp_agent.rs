@@ -88,6 +88,12 @@ fn reads_each_state_a_buyer_sees() {
         job_state(&jobs(json!({"job": "j2", "state": "paid"})), "j1"),
         None
     );
+    // A job the same wallet runs as provider, under the same id, isn't the buyer's.
+    let both = json!({"jobs": [
+        {"job": "j1", "role": "provider", "state": "delivered", "output": {"text": "theirs"}},
+        {"job": "j1", "role": "buyer", "state": "paid"},
+    ]});
+    assert_eq!(job_state(&both, "j1"), Some(JobState::Paid));
 }
 
 #[test]
@@ -174,5 +180,95 @@ fn pays_only_from_a_public_agent_account() {
     assert_eq!(
         payer(&accounts, "Public/Nobody"),
         Err("the wallet holds no account Public/Nobody".into())
+    );
+}
+
+use logos_inference::mcp_agent::{Fresh, wait_transfer};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
+
+#[test]
+fn loads_a_shared_value_once_however_many_ask() {
+    let fresh = Arc::new(Fresh::new(Duration::from_secs(5)));
+    let loads = Arc::new(AtomicU32::new(0));
+    let askers: Vec<_> = (0..8)
+        .map(|_| {
+            let (fresh, loads) = (fresh.clone(), loads.clone());
+            std::thread::spawn(move || {
+                fresh.get(|| {
+                    loads.fetch_add(1, Ordering::Relaxed);
+                    std::thread::sleep(Duration::from_millis(100));
+                    "listing"
+                })
+            })
+        })
+        .collect();
+    for asker in askers {
+        assert_eq!(asker.join().unwrap(), "listing");
+    }
+    assert_eq!(loads.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn loads_a_shared_value_again_once_stale() {
+    let fresh = Fresh::new(Duration::from_millis(50));
+    assert_eq!(fresh.get(|| 1), 1);
+    assert_eq!(fresh.get(|| 2), 1);
+    std::thread::sleep(Duration::from_millis(80));
+    assert_eq!(fresh.get(|| 3), 3);
+}
+
+fn statuses(list: Vec<serde_json::Value>) -> impl FnMut() -> Result<serde_json::Value, String> {
+    let mut list = list.into_iter();
+    move || Ok(list.next().unwrap_or(json!({"done": false})))
+}
+
+#[test]
+fn waits_for_a_transfer_to_finish() {
+    let soon = Instant::now() + Duration::from_secs(5);
+    let poll = Duration::from_millis(1);
+    let done = wait_transfer(
+        statuses(vec![
+            json!({"done": false}),
+            json!({"done": true, "success": true, "cid": "zDv"}),
+        ]),
+        soon,
+        None,
+        poll,
+    );
+    assert_eq!(done.unwrap()["cid"], json!("zDv"));
+    let failed = wait_transfer(
+        statuses(vec![
+            json!({"done": true, "success": false, "error": "no peers"}),
+        ]),
+        soon,
+        None,
+        poll,
+    );
+    assert_eq!(failed, Err("no peers".into()));
+    let late = wait_transfer(
+        statuses(vec![]),
+        Instant::now() + Duration::from_millis(20),
+        None,
+        poll,
+    );
+    assert_eq!(late, Err("the transfer didn't finish in time".into()));
+}
+
+#[test]
+fn gives_up_on_a_download_bigger_than_its_cap() {
+    let soon = Instant::now() + Duration::from_secs(5);
+    let big = wait_transfer(
+        statuses(vec![
+            json!({"done": false, "bytes": 1024, "total": 9u64 << 20}),
+        ]),
+        soon,
+        Some(8 << 20),
+        Duration::from_millis(1),
+    );
+    assert_eq!(
+        big,
+        Err(format!("it's {} bytes, over the 8 MiB taken", 9u64 << 20))
     );
 }

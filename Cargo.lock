@@ -897,10 +897,12 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 name = "logos-inference"
 version = "0.2.0"
 dependencies = [
+ "base64",
  "clap",
  "rmcp",
  "serde",
  "serde_json",
+ "socket2",
  "tiny_http",
  "tokio",
  "ureq",

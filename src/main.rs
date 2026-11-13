@@ -46,12 +46,20 @@ struct GatewayArgs {
     /// http://127.0.0.1:8766/mcp.
     #[arg(long)]
     agents_url: Option<String>,
+    /// logos-agents' files root, for prompts too big for a chat message and answers that come
+    /// through Logos Storage. Default: LOGOS_MCP_FILES_ROOT. Started by the gateway,
+    /// logos-agents gets it as its own.
+    #[arg(long)]
+    files_root: Option<std::path::PathBuf>,
     /// Where to listen.
     #[arg(long, default_value = "127.0.0.1:8090")]
     listen: String,
     /// The longest one completion may take, in seconds.
     #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..))]
     timeout_s: u64,
+    /// The most completions bought at once. More are answered 429 until one finishes.
+    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u64).range(1..))]
+    max_calls: u64,
     /// How long a provider has to quote before the next one is asked, in seconds. logos-agents
     /// asks a provider again after a minute without an answer, so the default leaves room.
     #[arg(long, default_value_t = 90, value_parser = clap::value_parser!(u64).range(1..))]
@@ -88,6 +96,11 @@ struct ServeArgs {
     /// so an answer stays well under the 8 MiB logos-agents delivers.
     #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u32).range(1..=262_144))]
     max_tokens: u32,
+    /// The largest prompt taken, in estimated tokens. With it, a prompt can also come as a
+    /// Logos Storage CID, quoted as if it were this big, since the quote sees only the CID.
+    /// Up to 2.2M: logos-agents passes at most 8 MiB.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=2_200_000))]
+    max_input_tokens: Option<u64>,
     /// The request field that caps the output: max_completion_tokens for hosted models that
     /// refuse max_tokens.
     #[arg(long, value_enum, default_value_t = TokenField::MaxTokens)]
@@ -112,9 +125,12 @@ fn main() -> ExitCode {
 }
 
 fn gateway(args: GatewayArgs) -> ExitCode {
+    let files_root = args
+        .files_root
+        .or_else(|| std::env::var_os("LOGOS_MCP_FILES_ROOT").map(Into::into));
     let agent = match &args.agents_url {
-        Some(url) => McpAgent::connect(url),
-        None => McpAgent::spawn(&args.agents_bin),
+        Some(url) => McpAgent::connect(url, files_root),
+        None => McpAgent::spawn(&args.agents_bin, files_root),
     };
     let agent = match agent {
         Ok(agent) => agent,
@@ -134,6 +150,8 @@ fn gateway(args: GatewayArgs) -> ExitCode {
             .filter(|k| !k.is_empty()),
         timeout: Duration::from_secs(args.timeout_s),
         keep_alive: Duration::from_secs(10),
+        max_calls: args.max_calls as usize,
+        send_timeout: Duration::from_secs(30),
     };
     let gateway = Gateway {
         agent,
@@ -175,6 +193,7 @@ fn serve(args: ServeArgs) -> ExitCode {
             input_lepta_per_token: args.input_lepta_per_token,
             output_lepta_per_token: args.output_lepta_per_token,
             max_tokens: args.max_tokens,
+            max_input_tokens: args.max_input_tokens,
         },
         backend: Backend {
             url: args.backend,

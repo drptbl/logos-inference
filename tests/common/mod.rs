@@ -1,7 +1,7 @@
 //! A scripted logos-agents for the gateway's tests.
 #![allow(dead_code)]
 
-use logos_inference::agent::{Agent, JobState, Payment, Provider};
+use logos_inference::agent::{Agent, Input, JobState, Payment, Provider};
 use logos_inference::gateway::Gateway;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -50,6 +50,9 @@ pub struct Log {
     pub pay_calls: Vec<String>,
     pub cancels: Vec<String>,
     pub finds: u32,
+    /// Each request's input, as it was sent.
+    pub inputs: Vec<Input>,
+    pub uploads: Vec<String>,
 }
 
 /// Where a job's money stands.
@@ -69,6 +72,8 @@ pub struct Fake {
     pub find_misses: Mutex<u32>,
     /// How long each job check takes.
     pub job_delay: Mutex<Duration>,
+    /// What Logos Storage holds, by CID.
+    pub stored: Mutex<HashMap<String, String>>,
     jobs: Mutex<HashMap<String, (Script, Money)>>,
     pub log: Mutex<Log>,
 }
@@ -82,6 +87,7 @@ pub fn fake(providers: &[(&str, Script)]) -> Fake {
         pay_mode: Mutex::new(PayMode::Pays),
         find_misses: Mutex::new(0),
         job_delay: Mutex::new(Duration::ZERO),
+        stored: Mutex::default(),
         jobs: Mutex::default(),
         log: Mutex::default(),
     }
@@ -106,12 +112,14 @@ impl Agent for Fake {
             .collect())
     }
 
-    fn request(&self, provider: &Provider, service: &str, input: &str) -> Result<String, String> {
+    fn request(&self, provider: &Provider, service: &str, input: &Input) -> Result<String, String> {
         assert_eq!(service, "inference/tiny/v1");
-        assert_eq!(
-            serde_json::from_str::<Value>(input).unwrap()["messages"][0]["content"],
-            json!("Hi")
-        );
+        let text = match input {
+            Input::Text(text) => text.clone(),
+            Input::Cid(cid) => self.stored.lock().unwrap()[cid].clone(),
+        };
+        assert!(serde_json::from_str::<Value>(&text).unwrap()["messages"].is_array());
+        self.log.lock().unwrap().inputs.push(input.clone());
         let script = self
             .providers
             .iter()
@@ -205,6 +213,26 @@ impl Agent for Fake {
     fn cancel(&self, job: &str) -> Result<(), String> {
         self.log.lock().unwrap().cancels.push(job.to_string());
         Ok(())
+    }
+
+    fn upload(&self, text: &str, _until: Instant) -> Result<String, String> {
+        let mut log = self.log.lock().unwrap();
+        let cid = format!("zUpload{}", log.uploads.len());
+        log.uploads.push(text.to_string());
+        self.stored
+            .lock()
+            .unwrap()
+            .insert(cid.clone(), text.to_string());
+        Ok(cid)
+    }
+
+    fn fetch(&self, cid: &str, _until: Instant) -> Result<String, String> {
+        self.stored
+            .lock()
+            .unwrap()
+            .get(cid)
+            .cloned()
+            .ok_or_else(|| format!("{cid} isn't in storage"))
     }
 }
 

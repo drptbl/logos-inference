@@ -8,7 +8,7 @@ use crate::openai::{ApiError, Call, translate};
 use serde_json::{Value, json};
 use std::io::{self, Write};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -22,6 +22,10 @@ pub struct GatewayConfig {
     pub timeout: Duration,
     /// How often a streamed completion says it's still waiting.
     pub keep_alive: Duration,
+    /// The most completions bought at once. More are turned away until one finishes.
+    pub max_calls: usize,
+    /// How long a write to a client may block, so one that stops reading lets go.
+    pub send_timeout: Duration,
 }
 
 pub struct GatewayServer<A: Agent> {
@@ -32,13 +36,28 @@ pub struct GatewayServer<A: Agent> {
 struct State<A: Agent> {
     gateway: Gateway<A>,
     config: GatewayConfig,
+    /// Completions being bought now.
+    calls: AtomicUsize,
+}
+
+/// One completion's place under `max_calls`, given back when it ends.
+struct Slot<'a>(&'a AtomicUsize);
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl<A: Agent + 'static> GatewayServer<A> {
     /// Listens on `addr`. Every completion spends from the wallet, so an address beyond this
     /// machine needs a key.
     pub fn bind(addr: &str, gateway: Gateway<A>, config: GatewayConfig) -> io::Result<Self> {
-        let http = tiny_http::Server::http(addr).map_err(io::Error::other)?;
+        let listener = std::net::TcpListener::bind(addr)?;
+        // Linux gives each connection the listener's send timeout. macOS doesn't, so there a
+        // client that stops reading holds its slot until it goes away.
+        socket2::SockRef::from(&listener).set_write_timeout(Some(config.send_timeout))?;
+        let http = tiny_http::Server::from_listener(listener, None).map_err(io::Error::other)?;
         let ip = http.server_addr().to_ip().map(|a| a.ip());
         if config.key.is_none() && !ip.is_some_and(|ip| ip.is_loopback()) {
             return Err(io::Error::other(
@@ -47,7 +66,11 @@ impl<A: Agent + 'static> GatewayServer<A> {
         }
         Ok(GatewayServer {
             http,
-            state: Arc::new(State { gateway, config }),
+            state: Arc::new(State {
+                gateway,
+                config,
+                calls: AtomicUsize::new(0),
+            }),
         })
     }
 
@@ -89,27 +112,42 @@ impl<A: Agent> State<A> {
                 respond(request, Ok(json!({"object": "list", "data": data})))
             }
             (tiny_http::Method::Post, "/v1/chat/completions") => {
-                let call =
-                    json_body(&mut request).and_then(|body| translate(&body, &self.config.models));
-                match call {
-                    Ok(call) if call.stream => self.stream(request, &call),
-                    Ok(call) => {
-                        // tiny_http can't tell when a client leaves mid-request.
-                        let answer = self.gateway.complete(
-                            &call,
-                            Instant::now() + self.config.timeout,
-                            &AtomicBool::new(false),
-                        );
-                        respond(request, answer.map(|text| completion(&call, &text)))
-                    }
-                    Err(e) => respond(request, Err(e)),
+                let call = match json_body(&mut request)
+                    .and_then(|body| translate(&body, &self.config.models))
+                {
+                    Ok(call) => call,
+                    Err(e) => return respond(request, Err(e)),
+                };
+                // Taken once the request is read and accepted, so only completions being bought count.
+                let Some(_slot) = self.slot() else {
+                    let max = self.config.max_calls;
+                    let busy = format!(
+                        "{max} completions are running, as many as this gateway takes at once: try again shortly"
+                    );
+                    return respond(request, Err(ApiError::new(429, busy)));
+                };
+                if call.stream {
+                    return self.stream(request, &call);
                 }
+                // tiny_http can't tell when a client leaves mid-request.
+                let answer = self.gateway.complete(
+                    &call,
+                    Instant::now() + self.config.timeout,
+                    &AtomicBool::new(false),
+                );
+                respond(request, answer.map(|text| completion(&call, &text)))
             }
             _ => respond(
                 request,
                 Err(ApiError::new(404, format!("no route for {path}"))),
             ),
         }
+    }
+
+    fn slot(&self) -> Option<Slot<'_>> {
+        let taken = self.calls.fetch_add(1, Ordering::Relaxed);
+        let slot = Slot(&self.calls);
+        (taken < self.config.max_calls).then_some(slot)
     }
 
     /// Lets a request in. With a key, only callers that send it. Without one, only local

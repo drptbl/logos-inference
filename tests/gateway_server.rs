@@ -15,12 +15,29 @@ fn start_with(agent: Fake, key: Option<&str>, keep_alive: Duration) -> String {
 }
 
 fn start_full(agent: Fake, key: Option<&str>, keep_alive: Duration, timeout: Duration) -> String {
-    let config = GatewayConfig {
+    start_config(
+        agent,
+        GatewayConfig {
+            key: key.map(Into::into),
+            timeout,
+            keep_alive,
+            ..config()
+        },
+    )
+}
+
+fn config() -> GatewayConfig {
+    GatewayConfig {
         models: vec!["tiny".into()],
-        key: key.map(Into::into),
-        timeout,
-        keep_alive,
-    };
+        key: None,
+        timeout: Duration::from_secs(5),
+        keep_alive: Duration::from_secs(10),
+        max_calls: 16,
+        send_timeout: Duration::from_secs(30),
+    }
+}
+
+fn start_config(agent: Fake, config: GatewayConfig) -> String {
     let server = GatewayServer::bind("127.0.0.1:0", gateway(agent), config).unwrap();
     let url = format!("http://{}", server.addr());
     thread::spawn(move || server.run());
@@ -188,6 +205,23 @@ fn raw(url: &str, version: &str, headers: &[(&str, &str)], body: &Value) -> (Str
     (head, rest)
 }
 
+/// The start of the answer to a completion request: its status line's first twelve bytes.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn status_line(url: &str, body: &Value) -> String {
+    let addr = url.trim_start_matches("http://");
+    let mut socket = TcpStream::connect(addr).unwrap();
+    let body = body.to_string();
+    write!(
+        socket,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut start = [0; 12];
+    socket.read_exact(&mut start).unwrap();
+    String::from_utf8_lossy(&start).into_owned()
+}
+
 /// A streamed completion read to the end: the head, and the stream's lines.
 fn raw_stream(url: &str, body: &Value) -> (String, Vec<String>) {
     let (head, rest) = raw(url, "HTTP/1.1", &[], body);
@@ -285,20 +319,18 @@ fn asks_for_the_key_when_it_has_one() {
 
 #[test]
 fn will_not_listen_beyond_this_machine_without_a_key() {
-    let config = |key: Option<&str>| GatewayConfig {
-        models: vec!["tiny".into()],
+    let with_key = |key: Option<&str>| GatewayConfig {
         key: key.map(Into::into),
-        timeout: Duration::from_secs(5),
-        keep_alive: Duration::from_secs(10),
+        ..config()
     };
-    let refused = GatewayServer::bind("0.0.0.0:0", gateway(fake(&[])), config(None))
+    let refused = GatewayServer::bind("0.0.0.0:0", gateway(fake(&[])), with_key(None))
         .err()
         .unwrap();
     assert_eq!(
         refused.to_string(),
         "listening beyond this machine needs a key: set LOGOS_INFERENCE_GATEWAY_KEY"
     );
-    assert!(GatewayServer::bind("0.0.0.0:0", gateway(fake(&[])), config(Some("k"))).is_ok());
+    assert!(GatewayServer::bind("0.0.0.0:0", gateway(fake(&[])), with_key(Some("k"))).is_ok());
 }
 
 #[test]
@@ -441,4 +473,83 @@ fn tells_clients_not_to_retry_once_money_may_have_moved() {
         !head.to_ascii_lowercase().contains("x-should-retry"),
         "nothing was paid: {head}"
     );
+}
+
+#[test]
+fn turns_away_completions_over_its_limit() {
+    let url = start_config(
+        fake(&[("a", Script::Late(10, "slow", Duration::from_millis(600)))]),
+        GatewayConfig {
+            max_calls: 1,
+            ..config()
+        },
+    );
+    let first = {
+        let url = url.clone();
+        thread::spawn(move || {
+            call(
+                "POST",
+                &format!("{url}/v1/chat/completions"),
+                Some(&chat(false)),
+                None,
+            )
+        })
+    };
+    thread::sleep(Duration::from_millis(150));
+    let (status, body) = call(
+        "POST",
+        &format!("{url}/v1/chat/completions"),
+        Some(&chat(false)),
+        None,
+    );
+    assert_eq!(status, 429, "{body}");
+    assert_eq!(
+        json_of(&body)["error"]["message"],
+        json!(
+            "1 completions are running, as many as this gateway takes at once: try again shortly"
+        )
+    );
+    assert_eq!(first.join().unwrap().0, 200);
+    // The limit is on completions only.
+    assert_eq!(call("GET", &format!("{url}/v1/models"), None, None).0, 200);
+}
+
+// Linux gives each connection the listener's send timeout; macOS doesn't, so there a client
+// that stops reading keeps its slot.
+#[cfg(target_os = "linux")]
+#[test]
+fn lets_go_of_a_client_that_stops_reading() {
+    // An answer far bigger than the socket buffers, to a client that never reads it.
+    let huge: &'static str = Box::leak("a".repeat(64 << 20).into_boxed_str());
+    let url = start_config(
+        fake(&[("a", Script::Quote(10, json!({ "text": huge })))]),
+        GatewayConfig {
+            max_calls: 1,
+            send_timeout: Duration::from_millis(300),
+            ..config()
+        },
+    );
+    let addr = url.trim_start_matches("http://").to_string();
+    let body = chat(true).to_string();
+    let mut stuck = TcpStream::connect(&addr).unwrap();
+    write!(
+        stuck,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    // The stuck stream frees its slot once a write times out.
+    let started = std::time::Instant::now();
+    loop {
+        // Only the status matters: the answer would be the same 64 MiB.
+        if status_line(&url, &chat(false)) != "HTTP/1.1 429" {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the stuck stream kept its slot"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    drop(stuck);
 }
