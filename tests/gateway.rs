@@ -272,18 +272,70 @@ fn gives_up_at_the_deadline_without_paying() {
 }
 
 #[test]
-fn turns_away_an_answer_delivered_through_storage() {
+fn fetches_an_answer_delivered_through_storage() {
     let g = gateway(fake(&[(
         "a",
-        Script::Quote(100, json!({"cid": "zDvZRwzm"})),
+        Script::Quote(100, json!({"cid": "zAnswer"})),
     )]));
+    g.agent
+        .stored
+        .lock()
+        .unwrap()
+        .insert("zAnswer".into(), "a long answer".into());
+    assert_eq!(
+        ask(&g, Duration::from_secs(5)),
+        Ok("a long answer".to_string())
+    );
+    let g = gateway(fake(&[("a", Script::Quote(100, json!({"cid": "zGone"})))]));
     let e = ask(&g, Duration::from_secs(5)).unwrap_err();
     assert_eq!(e.status, 502);
     assert_eq!(
         e.message,
-        "the answer came as Logos Storage CID zDvZRwzm, which the gateway can't fetch yet"
+        "the answer is in Logos Storage as zGone, but it couldn't be fetched: zGone isn't in storage"
     );
     assert!(!e.retryable);
+}
+
+#[test]
+fn sends_a_prompt_too_big_for_a_chat_message_through_storage() {
+    let call = |content: String| {
+        translate(
+            json!({"model": "tiny", "messages": [{"role": "user", "content": content}]})
+                .to_string()
+                .as_bytes(),
+            &["tiny".to_string()],
+        )
+        .unwrap()
+    };
+    let g = gateway(fake(&[("a", Script::Quote(100, answer("read it")))]));
+    let big = call("a".repeat(70_000));
+    assert_eq!(
+        g.complete(
+            &big,
+            Instant::now() + Duration::from_secs(5),
+            &AtomicBool::new(false)
+        ),
+        Ok("read it".to_string())
+    );
+    let log = g.agent.log.lock().unwrap();
+    assert_eq!(log.uploads, [big.input()]);
+    assert_eq!(
+        log.inputs,
+        [logos_inference::agent::Input::Cid("zUpload0".into())]
+    );
+    drop(log);
+    // Just under a chat message's room still goes as text.
+    let g = gateway(fake(&[("a", Script::Quote(100, answer("as text")))]));
+    let small = call("a".repeat(60_000));
+    assert_eq!(
+        g.complete(
+            &small,
+            Instant::now() + Duration::from_secs(5),
+            &AtomicBool::new(false)
+        ),
+        Ok("as text".to_string())
+    );
+    assert!(g.agent.log.lock().unwrap().uploads.is_empty());
 }
 
 #[test]

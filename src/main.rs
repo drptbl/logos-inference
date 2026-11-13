@@ -46,6 +46,11 @@ struct GatewayArgs {
     /// http://127.0.0.1:8766/mcp.
     #[arg(long)]
     agents_url: Option<String>,
+    /// logos-agents' files root, for prompts too big for a chat message and answers that come
+    /// through Logos Storage. Default: LOGOS_MCP_FILES_ROOT. Started by the gateway,
+    /// logos-agents gets it as its own.
+    #[arg(long)]
+    files_root: Option<std::path::PathBuf>,
     /// Where to listen.
     #[arg(long, default_value = "127.0.0.1:8090")]
     listen: String,
@@ -116,9 +121,12 @@ fn main() -> ExitCode {
 }
 
 fn gateway(args: GatewayArgs) -> ExitCode {
+    let files_root = args
+        .files_root
+        .or_else(|| std::env::var_os("LOGOS_MCP_FILES_ROOT").map(Into::into));
     let agent = match &args.agents_url {
-        Some(url) => McpAgent::connect(url),
-        None => McpAgent::spawn(&args.agents_bin),
+        Some(url) => McpAgent::connect(url, files_root),
+        None => McpAgent::spawn(&args.agents_bin, files_root),
     };
     let agent = match agent {
         Ok(agent) => agent,

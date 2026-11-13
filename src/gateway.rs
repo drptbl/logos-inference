@@ -1,12 +1,16 @@
 //! One completion bought over Logos: find a provider, keep to the price cap, pay, wait for the
 //! answer.
 
-use crate::agent::{Agent, JobState, Payment};
+use crate::agent::{Agent, Input, JobState, Payment};
 use crate::openai::{ApiError, Call};
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// The room a chat message has for the job input once JSON-escaped: logos-agents' limit,
+/// 64 KiB less 1 KiB for the rest of the message.
+const CHAT_ROOM: usize = 64 * 1024 - 1024;
 
 pub struct Gateway<A: Agent> {
     pub agent: A,
@@ -57,6 +61,7 @@ impl<A: Agent> Gateway<A> {
                 format!("no provider offers {} right now", call.model),
             ));
         }
+        let input = self.input(call)?;
         let left = || ApiError::new(499, "the client went away before anything was paid");
         let mut lowest_over: Option<u128> = None;
         let mut last_reason = None;
@@ -67,7 +72,7 @@ impl<A: Agent> Gateway<A> {
             if Instant::now() >= deadline {
                 break;
             }
-            let job = match self.agent.request(provider, &service, &call.input()) {
+            let job = match self.agent.request(provider, &service, &input) {
                 Ok(job) => job,
                 Err(e) => {
                     last_reason = Some(e);
@@ -117,6 +122,23 @@ impl<A: Agent> Gateway<A> {
         })
     }
 
+    /// The job input: in the chat message when it fits, as logos-agents measures it, or put
+    /// in Logos Storage and sent as its CID.
+    fn input(&self, call: &Call) -> Result<Input, ApiError> {
+        let text = call.input();
+        let escaped = serde_json::to_string(&text).map_or(usize::MAX, |e| e.len());
+        if escaped <= CHAT_ROOM {
+            return Ok(Input::Text(text));
+        }
+        let cid = self.agent.upload(&text).map_err(|e| {
+            ApiError::new(
+                502,
+                format!("the prompt couldn't be put in Logos Storage: {e}"),
+            )
+        })?;
+        Ok(Input::Cid(cid))
+    }
+
     /// Providers of `service`, asked again while discovery comes back empty, until `until`.
     fn find(&self, service: &str, until: Instant) -> Result<Vec<crate::agent::Provider>, ApiError> {
         loop {
@@ -156,6 +178,23 @@ impl<A: Agent> Gateway<A> {
         }
     }
 
+    /// The delivered answer's text, fetched from Logos Storage when it came as a CID.
+    fn answer(&self, output: Value) -> Result<String, ApiError> {
+        if let Some(text) = output.get("text").and_then(Value::as_str) {
+            return Ok(text.to_string());
+        }
+        let Some(cid) = output.get("cid").and_then(Value::as_str) else {
+            return Err(ApiError::new(502, "the answer couldn't be read").not_retryable());
+        };
+        self.agent.fetch(cid).map_err(|e| {
+            ApiError::new(
+                502,
+                format!("the answer is in Logos Storage as {cid}, but it couldn't be fetched: {e}"),
+            )
+            .not_retryable()
+        })
+    }
+
     /// Pays the quoted job once, then follows it to its answer. logos-agents finishes a
     /// payment it started, or one the user approves, on its own.
     fn pay(&self, job: &str, deadline: Instant) -> Result<String, ApiError> {
@@ -172,7 +211,7 @@ impl<A: Agent> Gateway<A> {
         };
         loop {
             match self.agent.job(job) {
-                Ok(Some(JobState::Delivered(output))) => return answer(output),
+                Ok(Some(JobState::Delivered(output))) => return self.answer(output),
                 Ok(Some(JobState::Ended(reason))) => {
                     return Err(ApiError::new(
                         502,
@@ -193,20 +232,4 @@ impl<A: Agent> Gateway<A> {
             thread::sleep(self.poll);
         }
     }
-}
-
-fn answer(output: Value) -> Result<String, ApiError> {
-    if let Some(text) = output.get("text").and_then(Value::as_str) {
-        return Ok(text.to_string());
-    }
-    Err(ApiError::new(
-        502,
-        match output.get("cid").and_then(Value::as_str) {
-            Some(cid) => format!(
-                "the answer came as Logos Storage CID {cid}, which the gateway can't fetch yet"
-            ),
-            None => "the answer couldn't be read".into(),
-        },
-    )
-    .not_retryable())
 }

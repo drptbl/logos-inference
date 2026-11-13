@@ -2,20 +2,34 @@
 //! running, such as the Basecamp module's, over HTTP. What its tools answer is read as
 //! logos-agents v0.4.0 words it.
 
-use crate::agent::{Agent, JobState, Payment, Provider};
+use crate::agent::{Agent, Input, JobState, Payment, Provider};
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::RunningService;
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::{Map, Value, json};
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Runtime;
 
 pub struct McpAgent {
     // Dropped before the runtime, so the client can still shut its server down.
     client: RunningService<RoleClient, ()>,
     runtime: Runtime,
+    /// logos-agents' files root, where storage uploads come from and downloads go.
+    files_root: Option<PathBuf>,
+    /// The last `service_jobs` listing and when it was taken, shared by every waiting call.
+    jobs: Mutex<Option<(Instant, Value)>>,
 }
+
+/// How long a `service_jobs` listing serves every call before it is asked again.
+const JOBS_FRESH: Duration = Duration::from_millis(900);
+/// How long a storage upload or download may take.
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(300);
+/// The largest answer read back from storage: logos-agents delivers at most 8 MiB.
+const MAX_FETCH: u64 = 8 << 20;
 
 /// How long one tool call may take. `service_pay` can wait a minute for an approval.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(90);
@@ -40,27 +54,96 @@ impl McpAgent {
     /// its wallet, network and discovery peers. Its follow-through, which tells the provider
     /// once a payment lands, runs every 5 seconds rather than its default minute, unless
     /// `LOGOS_AGENTS_FOLLOW_THROUGH_SECS` says otherwise: a client is waiting on each step.
-    pub fn spawn(bin: &str) -> Result<McpAgent, String> {
+    /// `files_root`, if given, becomes its `LOGOS_MCP_FILES_ROOT`, for storage.
+    pub fn spawn(bin: &str, files_root: Option<PathBuf>) -> Result<McpAgent, String> {
         let runtime = runtime()?;
+        let mut command = command(bin);
+        if let Some(root) = &files_root {
+            command.env("LOGOS_MCP_FILES_ROOT", root);
+        }
         let client = runtime.block_on(async {
-            let child = TokioChildProcess::new(command(bin))
-                .map_err(|e| format!("can't start {bin}: {e}"))?;
+            let child =
+                TokioChildProcess::new(command).map_err(|e| format!("can't start {bin}: {e}"))?;
             ().serve(child)
                 .await
                 .map_err(|e| format!("{bin} didn't start as an MCP server: {e}"))
         })?;
-        Ok(McpAgent { client, runtime })
+        Ok(McpAgent::new(client, runtime, files_root))
     }
 
-    /// Connects to a running MCP endpoint, e.g. `http://127.0.0.1:8766/mcp`.
-    pub fn connect(url: &str) -> Result<McpAgent, String> {
+    /// Connects to a running MCP endpoint, e.g. `http://127.0.0.1:8766/mcp`. `files_root` is
+    /// that server's files root, for storage.
+    pub fn connect(url: &str, files_root: Option<PathBuf>) -> Result<McpAgent, String> {
         let runtime = runtime()?;
         let client = runtime.block_on(async {
             ().serve(StreamableHttpClientTransport::from_uri(url.to_string()))
                 .await
                 .map_err(|e| format!("can't reach {url}: {e}"))
         })?;
-        Ok(McpAgent { client, runtime })
+        Ok(McpAgent::new(client, runtime, files_root))
+    }
+
+    fn new(
+        client: RunningService<RoleClient, ()>,
+        runtime: Runtime,
+        files_root: Option<PathBuf>,
+    ) -> McpAgent {
+        McpAgent {
+            client,
+            runtime,
+            files_root,
+            jobs: Mutex::new(None),
+        }
+    }
+
+    /// The files root, and a new file name there for this process's storage traffic.
+    fn scratch(&self, ext: &str) -> Result<(PathBuf, String), String> {
+        let root = self
+            .files_root
+            .as_ref()
+            .ok_or("storage needs logos-agents' files root: set --files-root")?;
+        std::fs::create_dir_all(root.join("logos-inference"))
+            .map_err(|e| format!("can't use the files root: {e}"))?;
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let name = format!(
+            "logos-inference/{nanos:x}-{}.{ext}",
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        Ok((root.clone(), name))
+    }
+
+    /// Waits for a storage transfer to finish, and returns its record.
+    fn transfer(&self, session: &Value) -> Result<Value, String> {
+        let session = session["session_id"]
+            .as_str()
+            .ok_or("storage gave no session")?
+            .to_string();
+        let until = Instant::now() + TRANSFER_TIMEOUT;
+        loop {
+            let status = self
+                .tool("storage_transfer_status", json!({ "session_id": session }))
+                .map_err(ToolError::text)?;
+            if status["done"] == json!(true) {
+                return if status["success"] == json!(true) {
+                    Ok(status)
+                } else {
+                    Err(status["error"]
+                        .as_str()
+                        .unwrap_or("the transfer failed")
+                        .to_string())
+                };
+            }
+            if Instant::now() >= until {
+                return Err(format!(
+                    "the transfer didn't finish in {}s",
+                    TRANSFER_TIMEOUT.as_secs()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
     }
 
     /// Checks that `address` is one of the wallet's public agent accounts, which is what
@@ -129,24 +212,34 @@ impl Agent for McpAgent {
         Ok(providers(&found))
     }
 
-    fn request(&self, provider: &Provider, service: &str, input: &str) -> Result<String, String> {
-        let asked = self
-            .tool(
-                "service_request",
-                json!({ "chat_address": provider.chat_address, "service_id": service, "input_text": input }),
-            )
-            .map_err(ToolError::text)?;
+    fn request(&self, provider: &Provider, service: &str, input: &Input) -> Result<String, String> {
+        let mut ask = json!({ "chat_address": provider.chat_address, "service_id": service });
+        match input {
+            Input::Text(text) => ask["input_text"] = json!(text),
+            Input::Cid(cid) => ask["input_cid"] = json!(cid),
+        }
+        let asked = self.tool("service_request", ask).map_err(ToolError::text)?;
         asked["job"]
             .as_str()
             .map(str::to_string)
             .ok_or_else(|| format!("service_request answered {asked}"))
     }
 
+    /// Read from one `service_jobs` listing at a time, however many calls are waiting.
     fn job(&self, job: &str) -> Result<Option<JobState>, String> {
-        let jobs = self
-            .tool("service_jobs", json!({}))
-            .map_err(ToolError::text)?;
-        Ok(job_state(&jobs, job))
+        let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        let fresh = jobs.as_ref().filter(|(at, _)| at.elapsed() < JOBS_FRESH);
+        let listing = match fresh {
+            Some((_, listing)) => listing.clone(),
+            None => {
+                let listing = self
+                    .tool("service_jobs", json!({}))
+                    .map_err(ToolError::text)?;
+                *jobs = Some((Instant::now(), listing.clone()));
+                listing
+            }
+        };
+        Ok(job_state(&listing, job))
     }
 
     fn pay(&self, job: &str, from: &str) -> Result<Payment, String> {
@@ -158,6 +251,46 @@ impl Agent for McpAgent {
             .map(|_| ())
             .map_err(ToolError::text)
     }
+
+    fn upload(&self, text: &str) -> Result<String, String> {
+        let (root, name) = self.scratch("txt")?;
+        let file = root.join(&name);
+        std::fs::write(&file, text)
+            .map_err(|e| format!("can't write the prompt for storage: {e}"))?;
+        let uploaded = self
+            .tool("storage_upload", json!({ "path": name }))
+            .map_err(ToolError::text)
+            .and_then(|session| self.transfer(&session));
+        let _ = std::fs::remove_file(&file);
+        uploaded?["cid"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| "storage gave no CID".into())
+    }
+
+    fn fetch(&self, cid: &str) -> Result<String, String> {
+        let (root, name) = self.scratch("out")?;
+        let file = root.join(&name);
+        let fetched = self
+            .tool("storage_download", json!({ "cid": cid, "path": name }))
+            .map_err(ToolError::text)
+            .and_then(|session| self.transfer(&session))
+            .and_then(|_| read_capped(&file));
+        let _ = std::fs::remove_file(&file);
+        String::from_utf8(fetched?).map_err(|_| "the answer isn't UTF-8 text".into())
+    }
+}
+
+fn read_capped(file: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(file)
+        .and_then(|f| f.take(MAX_FETCH + 1).read_to_end(&mut bytes))
+        .map_err(|e| format!("can't read the downloaded answer: {e}"))?;
+    if bytes.len() as u64 > MAX_FETCH {
+        return Err("the answer is over 8 MiB".into());
+    }
+    Ok(bytes)
 }
 
 /// The providers `service_find` lists, other than this node.

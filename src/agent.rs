@@ -27,6 +27,13 @@ pub enum JobState {
     Expired,
 }
 
+/// A job's input as it travels: in the chat message, or as a Logos Storage CID.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Input {
+    Text(String),
+    Cid(String),
+}
+
 /// What `service_pay` did.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Payment {
@@ -43,7 +50,7 @@ pub trait Agent: Send + Sync {
     /// Providers of `service`, other than this node.
     fn find(&self, service: &str) -> Result<Vec<Provider>, String>;
     /// Asks `provider` for a job, and returns its id.
-    fn request(&self, provider: &Provider, service: &str, input: &str) -> Result<String, String>;
+    fn request(&self, provider: &Provider, service: &str, input: &Input) -> Result<String, String>;
     /// The job's state, if this agent knows the job.
     fn job(&self, job: &str) -> Result<Option<JobState>, String>;
     /// Pays the job's quote. An `Err` means the money may have gone out: logos-agents never
@@ -51,4 +58,8 @@ pub trait Agent: Send + Sync {
     fn pay(&self, job: &str, from: &str) -> Result<Payment, String>;
     /// Withdraws an unpaid request.
     fn cancel(&self, job: &str) -> Result<(), String>;
+    /// Puts `text` in Logos Storage, and returns its CID.
+    fn upload(&self, text: &str) -> Result<String, String>;
+    /// The text Logos Storage holds as `cid`.
+    fn fetch(&self, cid: &str) -> Result<String, String>;
 }
