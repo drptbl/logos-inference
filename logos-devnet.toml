@@ -23,5 +23,6 @@ modules = ["chat_module", "libp2p_module"]
 # fleet.
 [messaging]
 
-# A local storage node the sessions share, for prompts and answers too big for a chat message.
+# Storage for the sessions, linked through the hub, for prompts and answers too big for a chat
+# message.
 [storage]

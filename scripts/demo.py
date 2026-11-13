@@ -37,7 +37,7 @@ INPUT_RATE = 10
 OUTPUT_RATE = 100
 MAX_TOKENS = 32
 # The largest prompt the offer takes, in estimated tokens: a CID prompt is quoted at this.
-MAX_INPUT_TOKENS = 40_000
+MAX_INPUT_TOKENS = 24_000
 # A prompt over a chat message's 64 KB, so the gateway sends it through Logos Storage.
 BIG_PROMPT = "Answer with one word, the word this text repeats: " + "logos " * 11_000
 
