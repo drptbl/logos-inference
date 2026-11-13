@@ -902,6 +902,7 @@ dependencies = [
  "rmcp",
  "serde",
  "serde_json",
+ "socket2",
  "tiny_http",
  "tokio",
  "ureq",
