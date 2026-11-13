@@ -1,6 +1,7 @@
 //! The buyer's side of logos-agents, as the gateway uses it: the `service_*` tools it calls.
 
 use serde_json::Value;
+use std::time::Instant;
 
 /// A provider that offers a service, as `service_find` lists it.
 #[derive(Debug, Clone, PartialEq)]
@@ -58,8 +59,8 @@ pub trait Agent: Send + Sync {
     fn pay(&self, job: &str, from: &str) -> Result<Payment, String>;
     /// Withdraws an unpaid request.
     fn cancel(&self, job: &str) -> Result<(), String>;
-    /// Puts `text` in Logos Storage, and returns its CID.
-    fn upload(&self, text: &str) -> Result<String, String>;
-    /// The text Logos Storage holds as `cid`.
-    fn fetch(&self, cid: &str) -> Result<String, String>;
+    /// Puts `text` in Logos Storage by `until`, and returns its CID.
+    fn upload(&self, text: &str, until: Instant) -> Result<String, String>;
+    /// The text Logos Storage holds as `cid`, fetched by `until`.
+    fn fetch(&self, cid: &str, until: Instant) -> Result<String, String>;
 }

@@ -112,6 +112,13 @@ impl<A: Agent> State<A> {
                 respond(request, Ok(json!({"object": "list", "data": data})))
             }
             (tiny_http::Method::Post, "/v1/chat/completions") => {
+                let call = match json_body(&mut request)
+                    .and_then(|body| translate(&body, &self.config.models))
+                {
+                    Ok(call) => call,
+                    Err(e) => return respond(request, Err(e)),
+                };
+                // Taken once the request is read and accepted, so only completions being bought count.
                 let Some(_slot) = self.slot() else {
                     let max = self.config.max_calls;
                     let busy = format!(
@@ -119,21 +126,16 @@ impl<A: Agent> State<A> {
                     );
                     return respond(request, Err(ApiError::new(429, busy)));
                 };
-                let call =
-                    json_body(&mut request).and_then(|body| translate(&body, &self.config.models));
-                match call {
-                    Ok(call) if call.stream => self.stream(request, &call),
-                    Ok(call) => {
-                        // tiny_http can't tell when a client leaves mid-request.
-                        let answer = self.gateway.complete(
-                            &call,
-                            Instant::now() + self.config.timeout,
-                            &AtomicBool::new(false),
-                        );
-                        respond(request, answer.map(|text| completion(&call, &text)))
-                    }
-                    Err(e) => respond(request, Err(e)),
+                if call.stream {
+                    return self.stream(request, &call);
                 }
+                // tiny_http can't tell when a client leaves mid-request.
+                let answer = self.gateway.complete(
+                    &call,
+                    Instant::now() + self.config.timeout,
+                    &AtomicBool::new(false),
+                );
+                respond(request, answer.map(|text| completion(&call, &text)))
             }
             _ => respond(
                 request,

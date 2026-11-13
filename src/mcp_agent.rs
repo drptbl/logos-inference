@@ -20,14 +20,18 @@ pub struct McpAgent {
     runtime: Runtime,
     /// logos-agents' files root, where storage uploads come from and downloads go.
     files_root: Option<PathBuf>,
-    /// The last `service_jobs` listing and when it was taken, shared by every waiting call.
-    jobs: Mutex<Option<(Instant, Value)>>,
+    /// The last `service_jobs` listing, shared by every waiting call.
+    jobs: Fresh<Result<Value, String>>,
 }
 
 /// How long a `service_jobs` listing serves every call before it is asked again.
 const JOBS_FRESH: Duration = Duration::from_millis(900);
-/// How long a storage upload or download may take.
+/// How long a storage upload or download may take, at most.
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(300);
+/// How often a storage transfer is checked.
+const TRANSFER_POLL: Duration = Duration::from_millis(500);
+/// How old a file left in the files root must be before it is cleared.
+const LEFTOVER_AGE: Duration = Duration::from_secs(3600);
 /// The largest answer read back from storage: logos-agents delivers at most 8 MiB.
 const MAX_FETCH: u64 = 8 << 20;
 
@@ -92,7 +96,7 @@ impl McpAgent {
             client,
             runtime,
             files_root,
-            jobs: Mutex::new(None),
+            jobs: Fresh::new(JOBS_FRESH),
         }
     }
 
@@ -102,8 +106,9 @@ impl McpAgent {
             .files_root
             .as_ref()
             .ok_or("storage needs logos-agents' files root: set --files-root")?;
-        std::fs::create_dir_all(root.join("logos-inference"))
-            .map_err(|e| format!("can't use the files root: {e}"))?;
+        let dir = root.join("logos-inference");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("can't use the files root: {e}"))?;
+        clear_leftovers(&dir, LEFTOVER_AGE);
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -116,34 +121,23 @@ impl McpAgent {
     }
 
     /// Waits for a storage transfer to finish, and returns its record.
-    fn transfer(&self, session: &Value) -> Result<Value, String> {
+    /// Waits until `until` at the latest for a storage transfer to finish, and returns its
+    /// record. A download bigger than `cap` is given up on as soon as storage says how big.
+    fn transfer(&self, session: &Value, until: Instant, cap: Option<u64>) -> Result<Value, String> {
         let session = session["session_id"]
             .as_str()
             .ok_or("storage gave no session")?
             .to_string();
-        let until = Instant::now() + TRANSFER_TIMEOUT;
-        loop {
-            let status = self
-                .tool("storage_transfer_status", json!({ "session_id": session }))
-                .map_err(ToolError::text)?;
-            if status["done"] == json!(true) {
-                return if status["success"] == json!(true) {
-                    Ok(status)
-                } else {
-                    Err(status["error"]
-                        .as_str()
-                        .unwrap_or("the transfer failed")
-                        .to_string())
-                };
-            }
-            if Instant::now() >= until {
-                return Err(format!(
-                    "the transfer didn't finish in {}s",
-                    TRANSFER_TIMEOUT.as_secs()
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(500));
-        }
+        let status = || {
+            self.tool("storage_transfer_status", json!({ "session_id": session }))
+                .map_err(ToolError::text)
+        };
+        wait_transfer(
+            status,
+            until.min(Instant::now() + TRANSFER_TIMEOUT),
+            cap,
+            TRANSFER_POLL,
+        )
     }
 
     /// Checks that `address` is one of the wallet's public agent accounts, which is what
@@ -227,18 +221,10 @@ impl Agent for McpAgent {
 
     /// Read from one `service_jobs` listing at a time, however many calls are waiting.
     fn job(&self, job: &str) -> Result<Option<JobState>, String> {
-        let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
-        let fresh = jobs.as_ref().filter(|(at, _)| at.elapsed() < JOBS_FRESH);
-        let listing = match fresh {
-            Some((_, listing)) => listing.clone(),
-            None => {
-                let listing = self
-                    .tool("service_jobs", json!({}))
-                    .map_err(ToolError::text)?;
-                *jobs = Some((Instant::now(), listing.clone()));
-                listing
-            }
-        };
+        let listing = self.jobs.get(|| {
+            self.tool("service_jobs", json!({}))
+                .map_err(ToolError::text)
+        })?;
         Ok(job_state(&listing, job))
     }
 
@@ -252,15 +238,17 @@ impl Agent for McpAgent {
             .map_err(ToolError::text)
     }
 
-    fn upload(&self, text: &str) -> Result<String, String> {
+    fn upload(&self, text: &str, until: Instant) -> Result<String, String> {
         let (root, name) = self.scratch("txt")?;
         let file = root.join(&name);
-        std::fs::write(&file, text)
-            .map_err(|e| format!("can't write the prompt for storage: {e}"))?;
-        let uploaded = self
-            .tool("storage_upload", json!({ "path": name }))
-            .map_err(ToolError::text)
-            .and_then(|session| self.transfer(&session));
+        let uploaded = std::fs::write(&file, text)
+            .map_err(|e| format!("can't write the prompt for storage: {e}"))
+            .and_then(|_| {
+                self.tool("storage_upload", json!({ "path": name }))
+                    .map_err(ToolError::text)
+            })
+            .and_then(|session| self.transfer(&session, until, None));
+        // Removed whatever happened: an upload still reading it keeps its open handle.
         let _ = std::fs::remove_file(&file);
         uploaded?["cid"]
             .as_str()
@@ -268,14 +256,15 @@ impl Agent for McpAgent {
             .ok_or_else(|| "storage gave no CID".into())
     }
 
-    fn fetch(&self, cid: &str) -> Result<String, String> {
+    fn fetch(&self, cid: &str, until: Instant) -> Result<String, String> {
         let (root, name) = self.scratch("out")?;
         let file = root.join(&name);
         let fetched = self
             .tool("storage_download", json!({ "cid": cid, "path": name }))
             .map_err(ToolError::text)
-            .and_then(|session| self.transfer(&session))
+            .and_then(|session| self.transfer(&session, until, Some(MAX_FETCH)))
             .and_then(|_| read_capped(&file));
+        // A download still going lands later: `scratch` clears it once it's old.
         let _ = std::fs::remove_file(&file);
         String::from_utf8(fetched?).map_err(|_| "the answer isn't UTF-8 text".into())
     }
@@ -288,9 +277,101 @@ fn read_capped(file: &Path) -> Result<Vec<u8>, String> {
         .and_then(|f| f.take(MAX_FETCH + 1).read_to_end(&mut bytes))
         .map_err(|e| format!("can't read the downloaded answer: {e}"))?;
     if bytes.len() as u64 > MAX_FETCH {
-        return Err("the answer is over 8 MiB".into());
+        return Err(format!("the answer is over {} MiB", MAX_FETCH >> 20));
     }
     Ok(bytes)
+}
+
+/// Polls a storage transfer's `status` until it's done, `until` passes, or a download shows a
+/// total over `cap`.
+pub fn wait_transfer(
+    mut status: impl FnMut() -> Result<Value, String>,
+    until: Instant,
+    cap: Option<u64>,
+    poll: Duration,
+) -> Result<Value, String> {
+    loop {
+        let now = status()?;
+        if let (Some(cap), Some(total)) = (cap, now["total"].as_u64())
+            && total > cap
+        {
+            return Err(format!(
+                "it's {total} bytes, over the {} MiB taken",
+                cap >> 20
+            ));
+        }
+        if now["done"] == json!(true) {
+            return if now["success"] == json!(true) {
+                Ok(now)
+            } else {
+                Err(now["error"]
+                    .as_str()
+                    .unwrap_or("the transfer failed")
+                    .to_string())
+            };
+        }
+        if Instant::now() >= until {
+            return Err("the transfer didn't finish in time".into());
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// Removes files in `dir` older than `age`: left by transfers that ran past their wait.
+fn clear_leftovers(dir: &Path, age: Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|at| at.elapsed().is_ok_and(|e| e > age));
+        if old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// A value that is loaded at most once per `for_`, however many threads ask. A thread that
+/// finds it stale loads it, while the others wait for that one load rather than each making
+/// their own; reading a fresh value never waits on a load.
+pub struct Fresh<T: Clone> {
+    value: Mutex<Option<(Instant, T)>>,
+    turn: Mutex<()>,
+    for_: Duration,
+}
+
+impl<T: Clone> Fresh<T> {
+    pub fn new(for_: Duration) -> Fresh<T> {
+        Fresh {
+            value: Mutex::new(None),
+            turn: Mutex::new(()),
+            for_,
+        }
+    }
+
+    fn fresh(&self) -> Option<T> {
+        let value = self.value.lock().unwrap_or_else(|e| e.into_inner());
+        value
+            .as_ref()
+            .filter(|(at, _)| at.elapsed() < self.for_)
+            .map(|(_, v)| v.clone())
+    }
+
+    pub fn get(&self, load: impl FnOnce() -> T) -> T {
+        if let Some(value) = self.fresh() {
+            return value;
+        }
+        let _turn = self.turn.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(value) = self.fresh() {
+            return value;
+        }
+        let value = load();
+        *self.value.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((Instant::now(), value.clone()));
+        value
+    }
 }
 
 /// The providers `service_find` lists, other than this node.
@@ -393,4 +474,30 @@ pub fn payer(accounts: &Value, address: &str) -> Result<(), String> {
         return Err(format!("{address} isn't one of the agent's own accounts"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clears_only_files_older_than_the_age() {
+        let dir =
+            std::env::temp_dir().join(format!("logos-inference-leftovers-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (old, new) = (dir.join("old.out"), dir.join("new.out"));
+        std::fs::write(&old, "left").unwrap();
+        std::fs::write(&new, "fresh").unwrap();
+        let hour_ago = SystemTime::now() - Duration::from_secs(7200);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(hour_ago)
+            .unwrap();
+        clear_leftovers(&dir, Duration::from_secs(3600));
+        assert!(!old.exists());
+        assert!(new.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

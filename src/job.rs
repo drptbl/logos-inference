@@ -15,6 +15,14 @@ pub struct Pricing {
     pub max_input_tokens: Option<u64>,
 }
 
+impl Pricing {
+    /// Input tokens at the input rate, and output tokens at the output rate.
+    fn price(&self, input_tokens: u64, output_tokens: u32) -> u128 {
+        input_tokens as u128 * self.input_lepta_per_token as u128
+            + output_tokens as u128 * self.output_lepta_per_token as u128
+    }
+}
+
 /// Why a request is turned away. The text goes to the buyer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Refusal(pub String);
@@ -54,8 +62,7 @@ impl Prompt {
     /// The input's estimated tokens at the input rate, plus the whole output cap at the
     /// output rate, since escrow locks one price before the output exists.
     pub fn price(&self, pricing: &Pricing) -> u128 {
-        self.input_tokens() as u128 * pricing.input_lepta_per_token as u128
-            + self.max_tokens as u128 * pricing.output_lepta_per_token as u128
+        pricing.price(self.input_tokens(), self.max_tokens)
     }
 }
 
@@ -79,9 +86,9 @@ pub enum Role {
 /// What a job's input costs: a text prompt by its estimated tokens, a CID at the offer's
 /// ceiling, since logos-agents asks for the quote before it fetches the content.
 pub fn quote(input: &Value, pricing: &Pricing, system: Option<&str>) -> Result<u128, Refusal> {
-    match (input.get("cid"), pricing.max_input_tokens) {
-        (Some(_), Some(ceiling)) => Ok(ceiling as u128 * pricing.input_lepta_per_token as u128
-            + pricing.max_tokens as u128 * pricing.output_lepta_per_token as u128),
+    let by_cid = input.get("text").is_none() && input.get("cid").is_some();
+    match pricing.max_input_tokens {
+        Some(ceiling) if by_cid => Ok(pricing.price(ceiling, pricing.max_tokens)),
         _ => Ok(parse(input, pricing, system)?.price(pricing)),
     }
 }

@@ -46,6 +46,12 @@ fn pays_the_first_provider_within_the_cap_and_answers_its_output() {
     assert_eq!(ask(&g, Duration::from_secs(5)), Ok("hello".to_string()));
     let log = g.agent.log.lock().unwrap();
     assert_eq!(log.requests, ["a"]);
+    assert_eq!(
+        log.inputs,
+        [logos_inference::agent::Input::Text(
+            r#"{"messages":[{"content":"Hi","role":"user"}]}"#.into()
+        )]
+    );
     assert_eq!(log.pay_calls, ["job-a"]);
     assert!(log.cancels.is_empty());
 }
@@ -324,6 +330,18 @@ fn sends_a_prompt_too_big_for_a_chat_message_through_storage() {
         [logos_inference::agent::Input::Cid("zUpload0".into())]
     );
     drop(log);
+    // Measured as it travels, escaped: 40,000 quotes take 80,000 bytes.
+    let g = gateway(fake(&[("a", Script::Quote(100, answer("quoted")))]));
+    let quotes = call("\"".repeat(40_000));
+    assert_eq!(
+        g.complete(
+            &quotes,
+            Instant::now() + Duration::from_secs(5),
+            &AtomicBool::new(false)
+        ),
+        Ok("quoted".to_string())
+    );
+    assert_eq!(g.agent.log.lock().unwrap().uploads.len(), 1);
     // Just under a chat message's room still goes as text.
     let g = gateway(fake(&[("a", Script::Quote(100, answer("as text")))]));
     let small = call("a".repeat(60_000));

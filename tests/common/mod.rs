@@ -215,7 +215,7 @@ impl Agent for Fake {
         Ok(())
     }
 
-    fn upload(&self, text: &str) -> Result<String, String> {
+    fn upload(&self, text: &str, _until: Instant) -> Result<String, String> {
         let mut log = self.log.lock().unwrap();
         let cid = format!("zUpload{}", log.uploads.len());
         log.uploads.push(text.to_string());
@@ -226,7 +226,7 @@ impl Agent for Fake {
         Ok(cid)
     }
 
-    fn fetch(&self, cid: &str) -> Result<String, String> {
+    fn fetch(&self, cid: &str, _until: Instant) -> Result<String, String> {
         self.stored
             .lock()
             .unwrap()

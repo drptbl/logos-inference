@@ -61,8 +61,11 @@ impl<A: Agent> Gateway<A> {
                 format!("no provider offers {} right now", call.model),
             ));
         }
-        let input = self.input(call)?;
         let left = || ApiError::new(499, "the client went away before anything was paid");
+        if gone.load(Ordering::Relaxed) {
+            return Err(left());
+        }
+        let input = self.input(call, deadline)?;
         let mut lowest_over: Option<u128> = None;
         let mut last_reason = None;
         for provider in &providers {
@@ -124,13 +127,13 @@ impl<A: Agent> Gateway<A> {
 
     /// The job input: in the chat message when it fits, as logos-agents measures it, or put
     /// in Logos Storage and sent as its CID.
-    fn input(&self, call: &Call) -> Result<Input, ApiError> {
+    fn input(&self, call: &Call, deadline: Instant) -> Result<Input, ApiError> {
         let text = call.input();
         let escaped = serde_json::to_string(&text).map_or(usize::MAX, |e| e.len());
         if escaped <= CHAT_ROOM {
             return Ok(Input::Text(text));
         }
-        let cid = self.agent.upload(&text).map_err(|e| {
+        let cid = self.agent.upload(&text, deadline).map_err(|e| {
             ApiError::new(
                 502,
                 format!("the prompt couldn't be put in Logos Storage: {e}"),
@@ -179,14 +182,14 @@ impl<A: Agent> Gateway<A> {
     }
 
     /// The delivered answer's text, fetched from Logos Storage when it came as a CID.
-    fn answer(&self, output: Value) -> Result<String, ApiError> {
+    fn answer(&self, output: Value, deadline: Instant) -> Result<String, ApiError> {
         if let Some(text) = output.get("text").and_then(Value::as_str) {
             return Ok(text.to_string());
         }
         let Some(cid) = output.get("cid").and_then(Value::as_str) else {
             return Err(ApiError::new(502, "the answer couldn't be read").not_retryable());
         };
-        self.agent.fetch(cid).map_err(|e| {
+        self.agent.fetch(cid, deadline).map_err(|e| {
             ApiError::new(
                 502,
                 format!("the answer is in Logos Storage as {cid}, but it couldn't be fetched: {e}"),
@@ -211,7 +214,7 @@ impl<A: Agent> Gateway<A> {
         };
         loop {
             match self.agent.job(job) {
-                Ok(Some(JobState::Delivered(output))) => return self.answer(output),
+                Ok(Some(JobState::Delivered(output))) => return self.answer(output, deadline),
                 Ok(Some(JobState::Ended(reason))) => {
                     return Err(ApiError::new(
                         502,

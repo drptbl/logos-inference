@@ -98,7 +98,8 @@ struct ServeArgs {
     max_tokens: u32,
     /// The largest prompt taken, in estimated tokens. With it, a prompt can also come as a
     /// Logos Storage CID, quoted as if it were this big, since the quote sees only the CID.
-    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    /// Up to 2.2M: logos-agents passes at most 8 MiB.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=2_200_000))]
     max_input_tokens: Option<u64>,
     /// The request field that caps the output: max_completion_tokens for hosted models that
     /// refuse max_tokens.
