@@ -124,16 +124,19 @@ def main():
     offers = os.path.join(logs, "offers.toml")
     write_offers(args.offers, offers, service, base)
 
-    wallet = sides.provider_wallet
-    provider_env = dict(
-        os.environ,
-        LOGOSCTL_CONFIG_DIR=sides.provider_session,
-        LOGOS_MCP_PRESET="logos.dev",
-        LOGOS_MCP_WALLET_CONFIG=os.path.join(wallet, "wallet_config.json"),
-        LOGOS_MCP_WALLET_STORAGE=os.path.join(wallet, "storage.json"),
-        LOGOS_MCP_DISCOVERY_BOOTSTRAP=sides.bootstrap,
-        LOGOS_AGENTS_FOLLOW_THROUGH_SECS=str(args.poll),
-    )
+    def side_env(session, wallet):
+        """The environment a side's logos-agents runs with, on the devnet."""
+        return dict(
+            os.environ,
+            LOGOSCTL_CONFIG_DIR=session,
+            LOGOS_MCP_PRESET="logos.dev",
+            LOGOS_MCP_WALLET_CONFIG=os.path.join(wallet, "wallet_config.json"),
+            LOGOS_MCP_WALLET_STORAGE=os.path.join(wallet, "storage.json"),
+            LOGOS_MCP_DISCOVERY_BOOTSTRAP=sides.bootstrap,
+            LOGOS_AGENTS_FOLLOW_THROUGH_SECS=str(args.poll),
+        )
+
+    provider_env = side_env(sides.provider_session, sides.provider_wallet)
     provider = buyer = gateway = None
     try:
         provider = subprocess.Popen([args.agents_bin, "provide", offers], env=provider_env, stdin=subprocess.DEVNULL,
@@ -182,15 +185,7 @@ def main():
         # One logos-agents per wallet: the buyer's goes behind the gateway now.
         buyer.close()
         buyer = None
-        buyer_env = dict(
-            os.environ,
-            LOGOSCTL_CONFIG_DIR=sides.buyer_session,
-            LOGOS_MCP_PRESET="logos.dev",
-            LOGOS_MCP_WALLET_CONFIG=os.path.join(sides.buyer_wallet, "wallet_config.json"),
-            LOGOS_MCP_WALLET_STORAGE=os.path.join(sides.buyer_wallet, "storage.json"),
-            LOGOS_MCP_DISCOVERY_BOOTSTRAP=sides.bootstrap,
-            LOGOS_AGENTS_FOLLOW_THROUGH_SECS=str(args.poll),
-        )
+        buyer_env = side_env(sides.buyer_session, sides.buyer_wallet)
         gateway, gateway_url = start_listening(
             [args.bin, "gateway", "--model", args.model, "--max-price-lepta", "100000",
              "--pay-from", sides.buyer_from, "--agents-bin", args.agents_bin, "--listen", "127.0.0.1:0",
@@ -212,7 +207,10 @@ def main():
                 events = [line[len("data: "):] for line in body.splitlines() if line.startswith("data: ")]
                 if events[-1:] != ["[DONE]"]:
                     sys.exit(f"the stream didn't end with [DONE]: {body}")
-                text = "".join(json.loads(e)["choices"][0]["delta"].get("content") or "" for e in events[:-1])
+                pieces = [json.loads(e) for e in events[:-1]]
+                if failed := next((p for p in pieces if "error" in p), None):
+                    sys.exit(f"the stream carried an error: {failed}")
+                text = "".join(p["choices"][0]["delta"].get("content") or "" for p in pieces)
             else:
                 text = json.loads(body)["choices"][0]["message"]["content"]
             if not text.strip():
@@ -225,6 +223,7 @@ def main():
     finally:
         if gateway:
             gateway.terminate()
+            gateway.wait(timeout=60)
         inference.terminate()
         if buyer:
             buyer.close()
